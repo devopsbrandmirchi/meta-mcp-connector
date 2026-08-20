@@ -68,10 +68,33 @@ sb: Optional[Client] = None
 
 # Claude.ai custom connectors need OAuth DCR. Enable when MCP_PUBLIC_URL is set
 # (Cloud Run deploy script sets this to https://SERVICE.run.app).
-MCP_PUBLIC_URL = (
-    os.environ.get("MCP_PUBLIC_URL", "").strip().rstrip("/")
-    or os.environ.get("BASE_URL", "").strip().rstrip("/")
-)
+def _resolve_public_url() -> str:
+    for key in ("MCP_PUBLIC_URL", "BASE_URL", "SERVICE_URL"):
+        raw = os.environ.get(key, "").strip().rstrip("/")
+        if raw:
+            return raw
+    # Cloud Run from Git often omits MCP_PUBLIC_URL — build the known URL shape.
+    service = os.environ.get("K_SERVICE", "").strip()
+    if not service:
+        return ""
+    region = (
+        os.environ.get("CLOUD_RUN_REGION", "").strip()
+        or os.environ.get("GOOGLE_CLOUD_REGION", "").strip()
+    )
+    project_number = (
+        os.environ.get("CLOUD_RUN_PROJECT_NUMBER", "").strip()
+        or os.environ.get("GCP_PROJECT_NUMBER", "").strip()
+        or os.environ.get("GOOGLE_CLOUD_PROJECT_NUMBER", "").strip()
+    )
+    if service and region and project_number:
+        return f"https://{service}-{project_number}.{region}.run.app"
+    # Known production service (Git → europe-west1) until env is set explicitly.
+    if service == "vdp-connector-git":
+        return "https://vdp-connector-git-573223329822.europe-west1.run.app"
+    return ""
+
+
+MCP_PUBLIC_URL = _resolve_public_url()
 MCP_OAUTH_PASSWORD = os.environ.get("MCP_OAUTH_PASSWORD", "").strip() or None
 
 
@@ -1156,11 +1179,12 @@ if __name__ == "__main__":
     try:
         if args.http:
             endpoint = f"http://{args.host}:{args.port}/mcp"
+            public = f"{MCP_PUBLIC_URL}/mcp" if MCP_PUBLIC_URL else endpoint
             print(
                 "\n"
                 "HTTP mode (streamable-http)\n"
-                f"  MCP endpoint : {endpoint}\n"
-                "  Cursor/Claude: use https://YOUR-CLOUD-RUN-URL/mcp when hosted\n"
+                f"  MCP endpoint : {public}\n"
+                "  Claude URL   : must end with /mcp (not the bare Cloud Run host)\n"
                 "  Example ask  : \"VDP views for Moix RV last 7 days\"\n"
                 "  Stop         : Ctrl+C\n",
                 file=sys.stderr,
