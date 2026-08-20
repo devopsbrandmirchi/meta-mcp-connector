@@ -20,6 +20,8 @@ Auth: SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY (RLS is on for most tables).
 Run:
   python vdp_mcp_server.py           # stdio (Claude Desktop / Cursor)
   python vdp_mcp_server.py --http    # http://127.0.0.1:8001/mcp
+  Cloud Run: MCP_TRANSPORT=http + PORT (8080) + HOST=0.0.0.0
+  Secrets via env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (Secret Manager)
 """
 
 from __future__ import annotations
@@ -73,11 +75,9 @@ def _client() -> Client:
     if not SUPABASE_KEY:
         raise RuntimeError(
             "Missing Supabase service-role key.\n"
-            "1) Open https://supabase.com/dashboard/project/rllwmeqingvuohyctddg/settings/api\n"
-            "2) Copy the service_role secret key\n"
-            "3) Put it in vdp_mcp_connector/.env as:\n"
-            "   SUPABASE_URL=https://rllwmeqingvuohyctddg.supabase.co\n"
-            "   SUPABASE_SERVICE_ROLE_KEY=your_service_role_key\n"
+            "Local: set SUPABASE_SERVICE_ROLE_KEY in .env\n"
+            "Cloud Run: inject via Secret Manager (--set-secrets).\n"
+            "Dashboard: https://supabase.com/dashboard/project/rllwmeqingvuohyctddg/settings/api\n"
             "Anon/publishable keys are not enough — most VDP tables use RLS."
         )
     sb = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -1052,6 +1052,17 @@ def list_user_access(email: str = "", limit: int = 30) -> str:
 if __name__ == "__main__":
     import argparse
 
+    # Cloud Run sets K_SERVICE; Dockerfile / deploy script set MCP_TRANSPORT=http.
+    on_cloud = bool(os.environ.get("K_SERVICE"))
+    default_http = (
+        os.environ.get("MCP_TRANSPORT", "").lower() == "http" or on_cloud
+    )
+    default_host = os.environ.get("HOST") or (
+        "0.0.0.0" if default_http else "127.0.0.1"
+    )
+    # Cloud Run injects PORT=8080; local HTTP default stays 8001.
+    default_port = int(os.environ.get("PORT", "8001" if not on_cloud else "8080"))
+
     parser = argparse.ArgumentParser(
         description=(
             "VDP MCP connector for Smart Analytics V2 (Supabase). "
@@ -1062,16 +1073,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--http",
         action="store_true",
-        help="Run HTTP MCP via Uvicorn (recommended for Cursor). Default port 8001.",
+        default=default_http,
+        help="Run HTTP MCP via Uvicorn (recommended for Cursor / Cloud Run).",
     )
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8001)
+    parser.add_argument("--host", default=default_host)
+    parser.add_argument("--port", type=int, default=default_port)
     args = parser.parse_args()
 
-    print(f"VDP MCP → Supabase {SUPABASE_URL}", file=sys.stderr)
+    print(f"VDP MCP → Supabase {SUPABASE_URL}", file=sys.stderr, flush=True)
     try:
         _client()
-        print("Supabase auth: service_role key loaded from .env", file=sys.stderr)
+        source = "env/Secret Manager" if on_cloud or not os.path.isfile(
+            os.path.join(_SCRIPT_DIR, ".env")
+        ) else ".env / env"
+        print(f"Supabase auth: service_role key loaded ({source})", file=sys.stderr, flush=True)
     except RuntimeError as e:
         sys.exit(f"ERROR: {e}")
 
@@ -1089,28 +1104,38 @@ if __name__ == "__main__":
         "get_ga4_sync_status",
         "list_user_access",
     ]
-    print("Tools: " + ", ".join(tools), file=sys.stderr)
+    print("Tools: " + ", ".join(tools), file=sys.stderr, flush=True)
 
     try:
         if args.http:
             endpoint = f"http://{args.host}:{args.port}/mcp"
             print(
                 "\n"
-                "Uvicorn HTTP mode (leave this terminal open)\n"
+                "HTTP mode (streamable-http)\n"
                 f"  MCP endpoint : {endpoint}\n"
-                "  Cursor config : Settings → MCP → server \"vdp\" → url above\n"
-                "  Example ask   : \"VDP views for Moix RV last 7 days\"\n"
-                "  Stop          : Ctrl+C\n",
+                "  Cursor/Claude: use https://YOUR-CLOUD-RUN-URL/mcp when hosted\n"
+                "  Example ask  : \"VDP views for Moix RV last 7 days\"\n"
+                "  Stop         : Ctrl+C\n",
                 file=sys.stderr,
+                flush=True,
             )
-            # FastMCP streamable-http uses Uvicorn under the hood.
-            mcp.run(transport="streamable-http", host=args.host, port=args.port)
+            from mcp.server.transport_security import TransportSecuritySettings
+
+            # DNS-rebinding protection blocks Cloud Run hostnames; disable like DV360.
+            mcp.run(
+                transport="streamable-http",
+                host=args.host,
+                port=args.port,
+                transport_security=TransportSecuritySettings(
+                    enable_dns_rebinding_protection=False
+                ),
+            )
         else:
             print(
                 "\n"
                 "stdio mode — Cursor/Claude spawn this process themselves.\n"
-                "For a visible Uvicorn listener (easier to debug), use:\n"
-                "  python vdp_mcp_server.py --http\n",
+                "For HTTP (local or Cloud Run): python vdp_mcp_server.py --http\n"
+                "Or set MCP_TRANSPORT=http (auto on Cloud Run via K_SERVICE).\n",
                 file=sys.stderr,
             )
             mcp.run()

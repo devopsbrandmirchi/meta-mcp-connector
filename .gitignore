@@ -1,4 +1,11 @@
 .env
 .venv/
+venv/
+myenv/
 __pycache__/
 *.pyc
+*.pyo
+service-role.key
+*.secret
+secrets/
+.DS_Store

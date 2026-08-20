@@ -1,0 +1,14 @@
+.git/
+.cursor/
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv/
+venv/
+myenv/
+*.md
+deploy-cloudrun.ps1
+service-role.key
+*.secret
+secrets/
