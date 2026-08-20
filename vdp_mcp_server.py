@@ -65,7 +65,48 @@ SUPABASE_KEY = (
 )
 
 sb: Optional[Client] = None
-mcp = FastMCP("vdp")
+
+# Claude.ai custom connectors need OAuth DCR. Enable when MCP_PUBLIC_URL is set
+# (Cloud Run deploy script sets this to https://SERVICE.run.app).
+MCP_PUBLIC_URL = (
+    os.environ.get("MCP_PUBLIC_URL", "").strip().rstrip("/")
+    or os.environ.get("BASE_URL", "").strip().rstrip("/")
+)
+MCP_OAUTH_PASSWORD = os.environ.get("MCP_OAUTH_PASSWORD", "").strip() or None
+
+
+def _build_mcp():
+    if not MCP_PUBLIC_URL:
+        return FastMCP("vdp")
+
+    from pydantic import AnyHttpUrl
+
+    from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
+
+    from vdp_oauth import ClaudeOAuthProvider
+
+    provider = ClaudeOAuthProvider(
+        base_url=MCP_PUBLIC_URL,
+        password=MCP_OAUTH_PASSWORD,
+    )
+    auth = AuthSettings(
+        issuer_url=AnyHttpUrl(MCP_PUBLIC_URL),
+        resource_server_url=AnyHttpUrl(MCP_PUBLIC_URL),
+        client_registration_options=ClientRegistrationOptions(
+            enabled=True,
+            valid_scopes=["vdp"],
+            default_scopes=["vdp"],
+        ),
+        required_scopes=["vdp"],
+    )
+    return FastMCP(
+        "vdp",
+        auth_server_provider=provider,
+        auth=auth,
+    )
+
+
+mcp = _build_mcp()
 
 
 def _client() -> Client:
@@ -1081,6 +1122,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     print(f"VDP MCP → Supabase {SUPABASE_URL}", file=sys.stderr, flush=True)
+    if MCP_PUBLIC_URL:
+        print(
+            f"OAuth for Claude: enabled (issuer={MCP_PUBLIC_URL})",
+            file=sys.stderr,
+            flush=True,
+        )
     try:
         _client()
         source = "env/Secret Manager" if on_cloud or not os.path.isfile(

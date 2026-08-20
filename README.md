@@ -115,7 +115,21 @@ Refresh MCP in Cursor until **vdp** is green. You do **not** need a local `pytho
 
 ### Claude custom connector
 
-**Settings → Connectors → Add custom connector** → paste the same `https://YOUR-CLOUD-RUN-URL/mcp` URL.
+Claude.ai **requires OAuth** for remote custom connectors. This server embeds a Claude-compatible OAuth provider (Dynamic Client Registration) when `MCP_PUBLIC_URL` is set (the deploy script sets it automatically).
+
+1. Deploy with `.\deploy-cloudrun.ps1 -ProjectId "YOUR_GCP_PROJECT_ID"`
+2. Remove any old broken connector named “VDP Report”
+3. **Settings → Connectors → Add custom connector**
+4. Paste **exactly**: `https://YOUR-CLOUD-RUN-URL/mcp` (must include `/mcp`)
+5. Leave **OAuth Client ID** empty in Advanced settings (DCR is enabled)
+6. Click Connect — Claude registers itself and authorizes briefly
+
+If you still see *“Couldn't register with … sign-in service”* (`ofid_…`):
+
+- Confirm the URL ends with `/mcp` (not the bare Cloud Run host)
+- Confirm the service is up: open `https://YOUR-CLOUD-RUN-URL/.well-known/oauth-authorization-server` — you should see JSON with `registration_endpoint`
+- Confirm `MCP_PUBLIC_URL` matches the service origin (redeploy if you changed the URL)
+- Do **not** paste a random Google/OAuth Client ID unless you set up an external IdP
 
 ### Local vs Cloud
 
@@ -125,11 +139,12 @@ Refresh MCP in Cursor until **vdp** is green. You do **not** need a local `pytho
 | URL | `http://127.0.0.1:8001/mcp` | `https://…run.app/mcp` |
 | Secrets | `.env` file | Secret Manager → `SUPABASE_SERVICE_ROLE_KEY` |
 | Host / port | `127.0.0.1:8001` | `0.0.0.0` + `PORT=8080` |
+| Claude OAuth | Off (no `MCP_PUBLIC_URL`) | On (`MCP_PUBLIC_URL` = service URL) |
 | Tools | Same | Same |
 
 ### Security note
 
-`--allow-unauthenticated` makes the MCP endpoint **publicly reachable**. Anyone with the URL can call tools that use your Supabase **service_role** key. Use this for a first working connector only; **add authentication** (IAM, IAP, API gateway, or shared secret) before sharing widely.
+`--allow-unauthenticated` makes the Cloud Run URL publicly reachable. OAuth means Claude must complete registration/authorize before tools work; random callers without a token get `401`. Still treat the URL as sensitive and add stronger auth before sharing widely.
 
 ## Example prompts
 

@@ -123,12 +123,25 @@ $url = gcloud run services describe $Service `
     --region $Region `
     --format="value(status.url)"
 
+# Claude OAuth discovery needs the public HTTPS origin as MCP_PUBLIC_URL.
+Write-Host "Setting MCP_PUBLIC_URL=$url for Claude OAuth discovery..."
+gcloud run services update $Service `
+    --project $ProjectId `
+    --region $Region `
+    --update-env-vars "MCP_PUBLIC_URL=$url"
+
 Write-Host ""
-Write-Host "Deployed. MCP connector URL:"
+Write-Host "Deployed. MCP connector URL (use this exact path):"
 Write-Host "  $url/mcp"
 Write-Host ""
 Write-Host "Cursor mcp.json:"
 Write-Host ("  `"vdp`": { `"url`": `"$url/mcp`" }")
 Write-Host ""
-Write-Host "Claude: Settings -> Connectors -> Add custom connector -> paste that URL."
-Write-Host "Security note: this service is publicly reachable; add auth before sharing widely."
+Write-Host "Claude.ai:"
+Write-Host "  Settings -> Connectors -> Add custom connector"
+Write-Host "  Name: VDP Report (or any name)"
+Write-Host "  URL:  $url/mcp"
+Write-Host "  Leave Advanced OAuth Client ID empty (server supports DCR)."
+Write-Host "  Click Connect — browser may briefly authorize, then tools appear."
+Write-Host ""
+Write-Host "Security note: service is publicly reachable; OAuth restricts tokens to Claude redirects."
