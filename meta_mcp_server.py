@@ -791,9 +791,9 @@ if __name__ == "__main__":
         os.environ.get("MCP_TRANSPORT", "").lower() == "http" or on_cloud
     )
     default_host = os.environ.get("HOST") or (
-        "0.0.0.0" if default_http else "127.0.0.1"
+        "0.0.0.0" if (default_http or on_cloud) else "127.0.0.1"
     )
-    default_port = int(os.environ.get("PORT", "8001" if not on_cloud else "8080"))
+    default_port = int(os.environ.get("PORT", "8080" if on_cloud else "8001"))
 
     parser = argparse.ArgumentParser(
         description="Meta MCP connector (Facebook Graph API)."
