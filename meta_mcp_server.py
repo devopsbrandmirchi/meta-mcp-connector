@@ -39,14 +39,38 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(_SCRIPT_DIR, ".env"))
 
 
+def _metadata_get(path: str) -> str:
+    """Read Cloud Run / GCE metadata (empty string when not on GCP)."""
+    try:
+        import httpx
+
+        res = httpx.get(
+            f"http://metadata.google.internal/computeMetadata/v1/{path.lstrip('/')}",
+            headers={"Metadata-Flavor": "Google"},
+            timeout=2.0,
+        )
+        if res.is_success:
+            return (res.text or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
 def _resolve_public_url() -> str:
+    """
+    Claude custom connectors need OAuth DCR. Enable when MCP_PUBLIC_URL is set
+    (deploy script sets this). Git → Cloud Run often omits it — derive from
+    K_SERVICE + metadata, then known production fallbacks.
+    """
     for key in ("MCP_PUBLIC_URL", "BASE_URL", "SERVICE_URL"):
         raw = os.environ.get(key, "").strip().rstrip("/")
         if raw:
             return raw
+
     service = os.environ.get("K_SERVICE", "").strip()
     if not service:
         return ""
+
     region = (
         os.environ.get("CLOUD_RUN_REGION", "").strip()
         or os.environ.get("GOOGLE_CLOUD_REGION", "").strip()
@@ -56,6 +80,15 @@ def _resolve_public_url() -> str:
         or os.environ.get("GCP_PROJECT_NUMBER", "").strip()
         or os.environ.get("GOOGLE_CLOUD_PROJECT_NUMBER", "").strip()
     )
+
+    if not project_number:
+        project_number = _metadata_get("project/numeric-project-id")
+    if not region:
+        # projects/123456789/regions/us-central1
+        meta_region = _metadata_get("instance/region")
+        if "/" in meta_region:
+            region = meta_region.rsplit("/", 1)[-1]
+
     if service and region and project_number:
         return f"https://{service}-{project_number}.{region}.run.app"
     return ""
@@ -79,12 +112,13 @@ def _build_mcp():
         base_url=MCP_PUBLIC_URL,
         password=MCP_OAUTH_PASSWORD,
     )
+    # valid_scopes=None → accept whatever Claude sends during DCR (avoids ofid_ register failures).
     auth = AuthSettings(
         issuer_url=AnyHttpUrl(MCP_PUBLIC_URL),
         resource_server_url=AnyHttpUrl(MCP_PUBLIC_URL),
         client_registration_options=ClientRegistrationOptions(
             enabled=True,
-            valid_scopes=["meta"],
+            valid_scopes=None,
             default_scopes=["meta"],
         ),
         required_scopes=["meta"],
@@ -653,6 +687,21 @@ def _cors_headers() -> dict[str, str]:
     }
 
 
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request):
+    """Public health check (no auth) — used to verify Cloud Run / OAuth readiness."""
+    from starlette.responses import JSONResponse
+
+    return JSONResponse(
+        {
+            "status": "ok",
+            "service": "meta",
+            "oauth_enabled": bool(MCP_PUBLIC_URL),
+            "public_url": MCP_PUBLIC_URL or None,
+        }
+    )
+
+
 @mcp.custom_route("/api/account-spend", methods=["GET", "OPTIONS"])
 async def api_account_spend(request):
     """JSON endpoint for account-spend.html — spend per ad account for a date."""
@@ -805,12 +854,20 @@ if __name__ == "__main__":
 
     print("Meta MCP → Facebook Graph API", file=sys.stderr, flush=True)
     if MCP_PUBLIC_URL:
-        print(f"OAuth for Claude: enabled ({MCP_PUBLIC_URL})", file=sys.stderr, flush=True)
+        print(f"OAuth for Claude: enabled (issuer={MCP_PUBLIC_URL})", file=sys.stderr, flush=True)
+    elif on_cloud:
+        print(
+            "WARNING: MCP_PUBLIC_URL not set — Claude OAuth DCR is disabled. "
+            "Set MCP_PUBLIC_URL=https://YOUR-SERVICE.run.app on Cloud Run.",
+            file=sys.stderr,
+            flush=True,
+        )
     try:
         _ensure_fb()
         print("Facebook app credentials loaded.", file=sys.stderr, flush=True)
     except (RuntimeError, MetaGraphError) as e:
-        sys.exit(f"ERROR: {e}")
+        # Do not crash the process — OAuth /health must stay up for Claude register.
+        print(f"WARNING: Facebook credentials not ready: {e}", file=sys.stderr, flush=True)
 
     tools = [
         "help_meta",

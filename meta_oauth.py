@@ -113,6 +113,10 @@ class ClaudeOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         if not client.client_id:
             raise AuthorizeError(error="invalid_request", error_description="Missing client_id")
 
+        scopes = list(params.scopes or [])
+        if self.scope not in scopes:
+            scopes.append(self.scope)
+
         code = f"mac_{secrets.token_hex(24)}"
         self.auth_codes[code] = AuthorizationCode(
             code=code,
@@ -120,7 +124,7 @@ class ClaudeOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
             redirect_uri=AnyUrl(redirect),
             redirect_uri_provided_explicitly=params.redirect_uri_provided_explicitly,
             expires_at=time.time() + 300,
-            scopes=params.scopes or [self.scope],
+            scopes=scopes,
             code_challenge=params.code_challenge,
             resource=params.resource,
             subject="meta-user",
