@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import sys
+import logging
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from typing import Any, Optional
@@ -227,6 +228,7 @@ def _filter_rows(
         r
         for r in rows
         if q in (r.get("campaign_name") or "").lower()
+        or q in (r.get("campaign_id") or "").lower()
         or q in (r.get("adset_name") or "").lower()
         or q in (r.get("ad_name") or "").lower()
     ]
@@ -239,14 +241,27 @@ def _fetch_insights(
     end: date,
     account_id: str = "",
     breakdowns: Optional[str] = None,
+    campaign: str = "",
+    time_increment: Any = 1,
 ) -> list[dict[str, Any]]:
-    return _fb().fetch_insights(
+    client = _fb()
+    if campaign.strip():
+        return client.fetch_insights_for_campaign(
+            account_id,
+            campaign,
+            level=level,
+            since=start,
+            until=end,
+            breakdowns=breakdowns,
+            time_increment=time_increment,
+        )
+    return client.fetch_insights(
         account_id,
         level=level,
         since=start,
         until=end,
         breakdowns=breakdowns,
-        time_increment=1,
+        time_increment=time_increment,
     )
 
 
@@ -449,19 +464,28 @@ def get_ads_summary(
 ) -> str:
     """Get Meta ads KPI totals for a date range (live Graph API insights)."""
     start, end = _date_range(start_date, end_date)
-    rows = _filter_rows(
-        _fetch_insights(level="ad", start=start, end=end, account_id=account_id),
+    # Account-level aggregate for the window (time_increment=all_days). Campaign
+    # filter resolves to the campaign edge when possible (D-5).
+    rows = _fetch_insights(
+        level="account" if not campaign.strip() else "campaign",
+        start=start,
+        end=end,
+        account_id=account_id,
         campaign=campaign,
+        time_increment="all_days",
     )
+    if campaign.strip():
+        rows = _filter_rows(rows, campaign=campaign)
     if not rows:
         return f"No ad data found for {start.isoformat()} to {end.isoformat()}."
 
     spend = _sum_field(rows, "amount_spent_usd", as_float=True)
     impressions = _sum_field(rows, "impressions")
-    reach = _sum_field(rows, "reach")
+    # Reach is not additive across rows — use max for multi-row, else the value.
+    reach_vals = [int(r.get("reach") or 0) for r in rows]
+    reach = max(reach_vals) if len(reach_vals) > 1 else (reach_vals[0] if reach_vals else 0)
     clicks = _sum_field(rows, "clicks_all")
     purchases = _sum_field(rows, "purchases")
-    meta_purchases = _sum_field(rows, "meta_purchases")
     purchase_value = _sum_field(rows, "purchases_value", as_float=True)
 
     lines = [
@@ -479,8 +503,7 @@ def get_ads_summary(
         f"Impressions: {_fmt_int(impressions)}",
         f"Reach: {_fmt_int(reach)}",
         f"Clicks: {_fmt_int(clicks)}",
-        f"Purchases: {_fmt_int(purchases)}",
-        f"Meta purchases: {_fmt_int(meta_purchases)}",
+        f"Purchases (omni): {_fmt_int(purchases)}",
         f"Purchase value: {_fmt_usd(purchase_value)}",
     ])
     if clicks > 0:
@@ -499,15 +522,22 @@ def get_daily_trend(
 ) -> str:
     """Daily Meta ads spend, impressions, clicks, and purchases (Graph API)."""
     start, end = _date_range(start_date, end_date)
-    rows = _filter_rows(
-        _fetch_insights(level="ad", start=start, end=end, account_id=account_id),
+    rows = _fetch_insights(
+        level="account" if not campaign.strip() else "campaign",
+        start=start,
+        end=end,
+        account_id=account_id,
         campaign=campaign,
+        time_increment=1,
     )
+    if campaign.strip():
+        rows = _filter_rows(rows, campaign=campaign)
+
     daily: dict[str, dict[str, float]] = defaultdict(
         lambda: {"spend": 0.0, "impressions": 0, "clicks": 0, "purchases": 0}
     )
     for r in rows:
-        d = str(r.get("day") or "")[:10]
+        d = str(r.get("date_start") or r.get("day") or "")[:10]
         if not d:
             continue
         daily[d]["spend"] += float(r.get("amount_spent_usd") or 0)
@@ -546,12 +576,13 @@ def get_performance_breakdown(
     limit: int = 25,
 ) -> str:
     """Break down Meta ads performance by campaign, adset, ad, platform, or placement."""
+    # level sets row granularity; breakdowns sets dimensional splits (D-2).
     dim_map = {
-        "campaign": ("campaign", "campaign_name"),
-        "adset": ("adset", "adset_name"),
-        "ad": ("ad", "ad_name"),
-        "platform": ("campaign", "platform"),
-        "placement": ("campaign", "placement"),
+        "campaign": ("campaign", "campaign_name", None),
+        "adset": ("adset", "adset_name", None),
+        "ad": ("ad", "ad_name", None),
+        "platform": ("ad", "publisher_platform", "publisher_platform"),
+        "placement": ("ad", "placement", "publisher_platform,platform_position"),
     }
     key = (by or "campaign").strip().lower()
     spec = dim_map.get(key)
@@ -559,25 +590,20 @@ def get_performance_breakdown(
         return "Unknown breakdown. Use by=campaign|adset|ad|platform|placement."
 
     start, end = _date_range(start_date, end_date)
-    level, col = spec
-    breakdowns = None
-    if key == "platform":
-        breakdowns = "publisher_platform"
-        col = "publisher_platform"
-    elif key == "placement":
-        breakdowns = "publisher_platform,platform_position"
-        col = "placement"
+    level, col, breakdowns = spec
 
-    rows = _filter_rows(
-        _fetch_insights(
-            level=level,
-            start=start,
-            end=end,
-            account_id=account_id,
-            breakdowns=breakdowns,
-        ),
+    rows = _fetch_insights(
+        level=level,
+        start=start,
+        end=end,
+        account_id=account_id,
+        breakdowns=breakdowns,
         campaign=campaign,
+        time_increment="all_days",
     )
+    if campaign.strip() and not _fb().resolve_campaign_id(account_id, campaign):
+        rows = _filter_rows(rows, campaign=campaign)
+
     if key == "placement":
         for r in rows:
             r["placement"] = (
@@ -597,7 +623,7 @@ def get_performance_breakdown(
 
     table = [
         [
-            name,
+            name if name and name != "(blank)" else "(unnamed)",
             _fmt_usd(v["amount_spent_usd"]),
             _fmt_int(v["impressions"]),
             _fmt_int(v["clicks_all"]),
@@ -625,10 +651,16 @@ def get_top_ads(
 ) -> str:
     """Top-performing ads ranked by spend, impressions, clicks, or purchases."""
     start, end = _date_range(start_date, end_date)
-    rows = _filter_rows(
-        _fetch_insights(level="ad", start=start, end=end, account_id=account_id),
+    rows = _fetch_insights(
+        level="ad",
+        start=start,
+        end=end,
+        account_id=account_id,
         campaign=campaign,
+        time_increment="all_days",
     )
+    if campaign.strip() and not _fb().resolve_campaign_id(account_id, campaign):
+        rows = _filter_rows(rows, campaign=campaign)
     if not rows:
         return "No ad-level data in that range."
 
@@ -853,6 +885,14 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     print("Meta MCP → Facebook Graph API", file=sys.stderr, flush=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        stream=sys.stderr,
+    )
+    # httpx logs full request URLs (including tokens) at INFO — keep those quiet.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     if MCP_PUBLIC_URL:
         print(f"OAuth for Claude: enabled (issuer={MCP_PUBLIC_URL})", file=sys.stderr, flush=True)
     elif on_cloud:

@@ -1,13 +1,16 @@
 """
 Facebook Graph API client for the Meta MCP connector.
 
-Auth uses FACEBOOK_APP_ID + FACEBOOK_APP_SECRET only (app access token via
-client_credentials — same app credentials as fb-full-sync, without a stored user token).
+Auth prefers FACEBOOK_ACCESS_TOKEN (user token with ads_read). Falls back to
+app token via client_credentials when no user token is set.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 import os
+import time
 from datetime import date
 from typing import Any, Optional
 from urllib.parse import urlencode
@@ -17,6 +20,10 @@ import httpx
 FB_API_VERSION = os.environ.get("FACEBOOK_API_VERSION", "v21.0").strip() or "v21.0"
 FB_BASE = f"https://graph.facebook.com/{FB_API_VERSION}"
 
+logger = logging.getLogger("meta-graph")
+
+# Core insight fields. Name fields are required when level is set — without them
+# Graph returns blank campaign/adset/ad names (defect D-2 / D-3).
 INSIGHT_FIELDS = [
     "campaign_id",
     "campaign_name",
@@ -26,6 +33,7 @@ INSIGHT_FIELDS = [
     "ad_name",
     "impressions",
     "clicks",
+    "inline_link_clicks",
     "spend",
     "cpc",
     "cpm",
@@ -39,6 +47,10 @@ INSIGHT_FIELDS = [
     "date_start",
     "date_stop",
 ]
+
+# Prefer omni_purchase (consolidated). Do not sum with purchase — that double-counts.
+PURCHASE_ACTION = "omni_purchase"
+PURCHASE_FALLBACK = "purchase"
 
 
 class MetaGraphError(Exception):
@@ -69,8 +81,21 @@ def _get_act_val(values: Optional[list[dict]], action_type: str) -> float:
     return 0.0
 
 
+def extract_purchases(row: dict[str, Any]) -> tuple[int, float]:
+    """Unpack purchases from nested actions / action_values (prefer omni_purchase)."""
+    purchases = int(_get_act(row.get("actions"), PURCHASE_ACTION))
+    value = _get_act_val(row.get("action_values"), PURCHASE_ACTION)
+    if purchases == 0 and value == 0:
+        purchases = int(_get_act(row.get("actions"), PURCHASE_FALLBACK))
+        value = _get_act_val(row.get("action_values"), PURCHASE_FALLBACK)
+    return purchases, value
+
+
 def normalize_insight_row(row: dict[str, Any]) -> dict[str, Any]:
     """Map Graph API insight row to MCP-friendly metric names."""
+    purchases, purchase_value = extract_purchases(row)
+    clicks = int(float(row.get("clicks") or 0))
+    link_clicks = int(float(row.get("inline_link_clicks") or 0))
     return {
         "campaign_id": row.get("campaign_id") or "",
         "campaign_name": row.get("campaign_name") or "",
@@ -79,6 +104,8 @@ def normalize_insight_row(row: dict[str, Any]) -> dict[str, Any]:
         "ad_id": row.get("ad_id") or "",
         "ad_name": row.get("ad_name") or "",
         "day": row.get("date_start") or row.get("date_stop") or "",
+        "date_start": row.get("date_start") or "",
+        "date_stop": row.get("date_stop") or "",
         "publisher_platform": row.get("publisher_platform") or "",
         "platform_position": row.get("platform_position") or "",
         "placement": row.get("platform_position") or row.get("publisher_platform") or "",
@@ -86,11 +113,12 @@ def normalize_insight_row(row: dict[str, Any]) -> dict[str, Any]:
         "amount_spent_usd": float(row.get("spend") or 0),
         "impressions": int(float(row.get("impressions") or 0)),
         "reach": int(float(row.get("reach") or 0)),
-        "clicks_all": int(float(row.get("clicks") or 0)),
-        "purchases": int(_get_act(row.get("actions"), "purchase")),
-        "meta_purchases": int(_get_act(row.get("actions"), "omni_purchase")),
-        "purchases_value": _get_act_val(row.get("action_values"), "purchase"),
-        "meta_purchase_value": _get_act_val(row.get("action_values"), "omni_purchase"),
+        "clicks_all": clicks,
+        "inline_link_clicks": link_clicks,
+        "purchases": purchases,
+        "meta_purchases": purchases,
+        "purchases_value": purchase_value,
+        "meta_purchase_value": purchase_value,
         "frequency": float(row.get("frequency") or 0),
         "cpc": float(row.get("cpc") or 0),
         "cpm": float(row.get("cpm") or 0),
@@ -170,19 +198,58 @@ class MetaGraphClient:
             return self.exchange_token()
         return self._access_token
 
-    def _graph_get(self, path: str, params: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    @staticmethod
+    def _safe_log_url(url: str, params: Optional[dict[str, Any]] = None) -> str:
+        """Loggable URL with secrets redacted (defect D-8)."""
+        safe_params = dict(params or {})
+        for key in ("access_token", "input_token", "client_secret"):
+            if key in safe_params:
+                safe_params[key] = "***"
+        if safe_params:
+            return f"{url}?{urlencode({k: str(v) for k, v in safe_params.items()})}"
+        redacted = url
+        for key in ("access_token", "input_token", "client_secret"):
+            if f"{key}=" in redacted:
+                # crude redact of query value
+                parts = redacted.split(f"{key}=")
+                if len(parts) > 1:
+                    rest = parts[1]
+                    amp = rest.find("&")
+                    redacted = parts[0] + f"{key}=***" + (rest[amp:] if amp >= 0 else "")
+        return redacted
+
+    def _graph_get(
+        self, path: str, params: Optional[dict[str, Any]] = None
+    ) -> dict[str, Any]:
+        """
+        GET Graph API.
+
+        Always pass query params as a dict for relative paths. Never embed the
+        query string in `path` — Graph silently drops malformed/duplicated
+        params (root cause of D-1 / D-2 / D-4).
+        """
         if path.startswith("http"):
-            with httpx.Client(timeout=120.0) as client:
+            log_url = self._safe_log_url(path)
+            logger.info("Graph GET %s", log_url)
+            with httpx.Client(timeout=180.0) as client:
                 res = client.get(path)
                 data = res.json() if res.content else {}
         else:
+            # Strip any accidental query fragment from path.
+            clean_path = path.split("?", 1)[0].lstrip("/")
             q = dict(params or {})
             if "access_token" not in q:
                 q["access_token"] = self.access_token()
-            url = f"{FB_BASE}/{path.lstrip('/')}"
-            with httpx.Client(timeout=120.0) as client:
+            # Never send date_preset alongside time_range — date_preset wins.
+            if "time_range" in q and "date_preset" in q:
+                q.pop("date_preset", None)
+            url = f"{FB_BASE}/{clean_path}"
+            log_url = self._safe_log_url(url, q)
+            logger.info("Graph GET %s", log_url)
+            with httpx.Client(timeout=180.0) as client:
                 res = client.get(url, params=q)
                 data = res.json() if res.content else {}
+
         if not res.is_success:
             err = data.get("error")
             if isinstance(err, dict):
@@ -191,11 +258,50 @@ class MetaGraphClient:
                 if code == 190:
                     self._access_token = None
                     raise MetaGraphError(
-                        f"Facebook auth failed: {msg}. Check FACEBOOK_APP_ID and FACEBOOK_APP_SECRET."
+                        f"Facebook auth failed: {msg}. Check FACEBOOK_APP_ID / "
+                        "FACEBOOK_APP_SECRET / FACEBOOK_ACCESS_TOKEN."
                     )
                 raise MetaGraphError(f"Graph API error: {msg}")
             raise MetaGraphError(f"Graph API HTTP {res.status_code}: {data}")
         return data
+
+    def _graph_post(
+        self, path: str, params: Optional[dict[str, Any]] = None
+    ) -> dict[str, Any]:
+        clean_path = path.split("?", 1)[0].lstrip("/")
+        q = dict(params or {})
+        if "access_token" not in q:
+            q["access_token"] = self.access_token()
+        url = f"{FB_BASE}/{clean_path}"
+        logger.info("Graph POST %s", self._safe_log_url(url, q))
+        with httpx.Client(timeout=180.0) as client:
+            res = client.post(url, data=q)
+            data = res.json() if res.content else {}
+        if not res.is_success:
+            err = data.get("error")
+            if isinstance(err, dict):
+                raise MetaGraphError(f"Graph API error: {err.get('message') or err}")
+            raise MetaGraphError(f"Graph API HTTP {res.status_code}: {data}")
+        return data
+
+    def _paginate(
+        self, path: str, params: Optional[dict[str, Any]] = None, *, max_pages: int = 50
+    ) -> list[dict[str, Any]]:
+        """Follow paging.next until exhausted (defect D-6)."""
+        rows: list[dict[str, Any]] = []
+        data = self._graph_get(path, params)
+        rows.extend(data.get("data") or [])
+        pages = 1
+        next_url = (data.get("paging") or {}).get("next")
+        while next_url and pages < max_pages:
+            data = self._graph_get(next_url)
+            batch = data.get("data") or []
+            if not batch:
+                break
+            rows.extend(batch)
+            next_url = (data.get("paging") or {}).get("next")
+            pages += 1
+        return rows
 
     def fetch_insights(
         self,
@@ -205,30 +311,149 @@ class MetaGraphClient:
         since: date,
         until: date,
         breakdowns: Optional[str] = None,
-        time_increment: int = 1,
+        time_increment: Any = 1,
         limit: int = 500,
+        filtering: Optional[list[dict[str, Any]]] = None,
+        object_id: str = "",
+        use_async: bool = False,
     ) -> list[dict[str, Any]]:
-        """Paginated insights fetch (same fields/levels as fb-full-sync)."""
+        """
+        Paginated insights fetch with correct Graph params (D-1..D-4, D-7, D-8).
+
+        time_range MUST be a JSON string. level / breakdowns / time_increment /
+        fields must be sent as query params (not baked into a broken path).
+        """
         act = self.resolve_account_id(account_id)
-        time_range = f'{{"since":"{since.isoformat()}","until":"{until.isoformat()}"}}'
+        # JSON string — raw dict is silently discarded by Graph (D-1).
+        time_range = json.dumps(
+            {"since": since.isoformat(), "until": until.isoformat()},
+            separators=(",", ":"),
+        )
         params: dict[str, Any] = {
             "fields": ",".join(INSIGHT_FIELDS),
             "level": level,
             "time_range": time_range,
             "time_increment": time_increment,
-            "limit": limit,
+            "limit": min(limit, 500),
+            "action_attribution_windows": json.dumps(
+                ["7d_click", "1d_view"], separators=(",", ":")
+            ),
         }
         if breakdowns:
             params["breakdowns"] = breakdowns
+        if filtering:
+            params["filtering"] = json.dumps(filtering)
 
-        url: Optional[str] = f"act_{act}/insights?{urlencode(params)}"
-        rows: list[dict[str, Any]] = []
-        while url:
-            data = self._graph_get(url)
-            batch = data.get("data") or []
-            rows.extend(batch)
-            url = (data.get("paging") or {}).get("next")
-        return [normalize_insight_row(r) for r in rows]
+        edge = f"{object_id}/insights" if object_id else f"act_{act}/insights"
+
+        # Wide ad-level ranges: prefer async report run (D-7).
+        day_span = (until - since).days
+        if use_async or (level == "ad" and day_span > 14 and not object_id):
+            try:
+                return self._fetch_insights_async(edge, params)
+            except MetaGraphError as exc:
+                logger.warning("Async insights failed (%s); falling back to sync", exc)
+
+        raw = self._paginate(edge, params)
+        return [normalize_insight_row(r) for r in raw]
+
+    def _fetch_insights_async(
+        self, edge: str, params: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """POST /insights → report_run_id → poll until complete (D-7)."""
+        post_params = dict(params)
+        data = self._graph_post(edge, post_params)
+        run_id = data.get("report_run_id") or data.get("id")
+        if not run_id:
+            raise MetaGraphError(f"Async insights did not return report_run_id: {data}")
+
+        # Poll job status
+        for _ in range(60):
+            status = self._graph_get(
+                str(run_id),
+                {"fields": "async_status,async_percent_completion"},
+            )
+            state = (status.get("async_status") or "").upper()
+            if state == "JOB_COMPLETED":
+                break
+            if state in ("JOB_FAILED", "JOB_SKIPPED"):
+                raise MetaGraphError(f"Async insights job failed: {status}")
+            time.sleep(2)
+        else:
+            raise MetaGraphError("Async insights job timed out")
+
+        raw = self._paginate(f"{run_id}/insights", {"limit": 500})
+        return [normalize_insight_row(r) for r in raw]
+
+    def resolve_campaign_id(self, account_id: str, campaign: str) -> Optional[str]:
+        """Resolve campaign name (or id) to Graph campaign id (D-5)."""
+        q = (campaign or "").strip()
+        if not q:
+            return None
+        if q.isdigit() or q.startswith("120"):
+            return q.removeprefix("act_")
+
+        rows = self.list_campaign_objects(account_id=account_id, search=q, limit=200)
+        q_lower = q.lower()
+        exact = [r for r in rows if (r.get("name") or "").lower() == q_lower]
+        if exact:
+            return exact[0].get("id")
+        partial = [
+            r for r in rows if q_lower in (r.get("name") or "").lower()
+        ]
+        if len(partial) == 1:
+            return partial[0].get("id")
+        if partial:
+            # Prefer ACTIVE exact-ish match
+            active = [
+                r
+                for r in partial
+                if (r.get("status") or "").upper() == "ACTIVE"
+            ]
+            if len(active) == 1:
+                return active[0].get("id")
+            return partial[0].get("id")
+        return None
+
+    def fetch_insights_for_campaign(
+        self,
+        account_id: str,
+        campaign: str,
+        *,
+        level: str,
+        since: date,
+        until: date,
+        breakdowns: Optional[str] = None,
+        time_increment: Any = 1,
+    ) -> list[dict[str, Any]]:
+        """Fetch insights filtered to one campaign (D-5)."""
+        campaign_id = self.resolve_campaign_id(account_id, campaign)
+        if campaign_id:
+            return self.fetch_insights(
+                account_id,
+                level=level,
+                since=since,
+                until=until,
+                breakdowns=breakdowns,
+                time_increment=time_increment,
+                object_id=campaign_id,
+            )
+        # Fallback: account-level filtering by campaign name
+        return self.fetch_insights(
+            account_id,
+            level=level,
+            since=since,
+            until=until,
+            breakdowns=breakdowns,
+            time_increment=time_increment,
+            filtering=[
+                {
+                    "field": "campaign.name",
+                    "operator": "CONTAIN",
+                    "value": campaign.strip(),
+                }
+            ],
+        )
 
     _AD_ACCOUNT_FIELDS = (
         "account_id,name,account_status,currency,"
@@ -284,7 +509,7 @@ class MetaGraphClient:
         return self.list_all_ad_accounts(limit=limit)
 
     def list_all_ad_accounts(self, limit: int = 50) -> list[dict[str, Any]]:
-        """List ad accounts with parent Business Manager (works with app token)."""
+        """List ad accounts with parent Business Manager."""
         cap = max(1, min(limit, 500))
         fields = self._AD_ACCOUNT_FIELDS
         seen: set[str] = set()
@@ -307,9 +532,14 @@ class MetaGraphClient:
 
         try:
             data = self._graph_get(
-                "me/adaccounts", {"fields": fields, "limit": cap}
+                "me/adaccounts", {"fields": fields, "limit": min(cap, 100)}
             )
             _append(data.get("data") or [], "user")
+            next_url = (data.get("paging") or {}).get("next")
+            while next_url and len(rows) < cap:
+                data = self._graph_get(next_url)
+                _append(data.get("data") or [], "user")
+                next_url = (data.get("paging") or {}).get("next")
             if rows:
                 return rows[:cap]
         except MetaGraphError:
@@ -339,10 +569,11 @@ class MetaGraphClient:
                 ("client", "client_ad_accounts"),
             ):
                 try:
-                    data = self._graph_get(
-                        f"{biz_id}/{edge}", {"fields": fields, "limit": cap}
+                    batch = self._paginate(
+                        f"{biz_id}/{edge}",
+                        {"fields": fields, "limit": min(cap, 100)},
                     )
-                    _append(data.get("data") or [], relationship, parent)
+                    _append(batch, relationship, parent)
                 except MetaGraphError:
                     continue
 
@@ -360,7 +591,10 @@ class MetaGraphClient:
     ) -> list[dict[str, Any]]:
         """List ad accounts with account-level spend for a date range."""
         accounts = self.list_all_ad_accounts(limit=account_limit)
-        time_range = f'{{"since":"{since.isoformat()}","until":"{until.isoformat()}"}}'
+        time_range = json.dumps(
+            {"since": since.isoformat(), "until": until.isoformat()},
+            separators=(",", ":"),
+        )
         results: list[dict[str, Any]] = []
         for acct in accounts:
             aid = acct["account_id"]
@@ -374,7 +608,7 @@ class MetaGraphClient:
                         "fields": "spend,impressions,clicks",
                         "level": "account",
                         "time_range": time_range,
-                        "time_increment": 1,
+                        "time_increment": "all_days",
                         "limit": 1,
                     },
                 )
@@ -403,14 +637,20 @@ class MetaGraphClient:
         act = self.resolve_account_id(account_id)
         params: dict[str, Any] = {
             "fields": "id,name,status,objective",
-            "limit": min(limit, 500),
+            "limit": min(max(limit, 1), 200),
         }
         if search.strip():
-            params["filtering"] = (
-                f'[{{"field":"name","operator":"CONTAIN","value":"{search.strip()}"}}]'
+            params["filtering"] = json.dumps(
+                [
+                    {
+                        "field": "name",
+                        "operator": "CONTAIN",
+                        "value": search.strip(),
+                    }
+                ]
             )
-        data = self._graph_get(f"act_{act}/campaigns", params)
-        return data.get("data") or []
+        rows = self._paginate(f"act_{act}/campaigns", params)
+        return rows[:limit] if limit else rows
 
     def list_adset_objects(
         self, account_id: str = "", search: str = "", limit: int = 100
@@ -418,14 +658,20 @@ class MetaGraphClient:
         act = self.resolve_account_id(account_id)
         params: dict[str, Any] = {
             "fields": "id,name,status,campaign_id",
-            "limit": min(limit, 500),
+            "limit": min(max(limit, 1), 200),
         }
         if search.strip():
-            params["filtering"] = (
-                f'[{{"field":"name","operator":"CONTAIN","value":"{search.strip()}"}}]'
+            params["filtering"] = json.dumps(
+                [
+                    {
+                        "field": "name",
+                        "operator": "CONTAIN",
+                        "value": search.strip(),
+                    }
+                ]
             )
-        data = self._graph_get(f"act_{act}/adsets", params)
-        return data.get("data") or []
+        rows = self._paginate(f"act_{act}/adsets", params)
+        return rows[:limit] if limit else rows
 
     def debug_token(self, *, input_token: Optional[str] = None) -> dict[str, Any]:
         """Inspect a token (defaults to the active connector token)."""
