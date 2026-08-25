@@ -1,22 +1,19 @@
-# Deploy VDP MCP connector to Google Cloud Run (mirrors DV360MCP/deploy-cloudrun.ps1).
+# Deploy Meta MCP connector to Google Cloud Run.
 #
 # Usage:
 #   .\deploy-cloudrun.ps1 -ProjectId "YOUR_GCP_PROJECT_ID"
-#   .\deploy-cloudrun.ps1 -ProjectId "YOUR_GCP_PROJECT_ID" -Region "us-central1" -Service "vdp-mcp"
-#   .\deploy-cloudrun.ps1 -ProjectId "..." -SecretFile ".\service-role.key"
+#   .\deploy-cloudrun.ps1 -ProjectId "YOUR_GCP_PROJECT_ID" -Region "us-central1" -Service "meta-mcp"
 #
-# Secret: uploads SUPABASE_SERVICE_ROLE_KEY to Secret Manager (never commits it).
-# Reads from -SecretFile, or .env (SUPABASE_SERVICE_ROLE_KEY=...), or prompts.
+# Secrets: FACEBOOK_APP_SECRET via Secret Manager.
+# Non-secret env: FACEBOOK_APP_ID, FACEBOOK_AD_ACCOUNT_ID
 
 param(
     [Parameter(Mandatory = $true)]
     [string]$ProjectId,
 
     [string]$Region = "us-central1",
-    [string]$Service = "vdp-mcp",
-    [string]$SecretName = "vdp-supabase-service-role",
-    [string]$SecretFile = "",
-    [string]$SupabaseUrl = "https://rllwmeqingvuohyctddg.supabase.co"
+    [string]$Service = "meta-mcp",
+    [string]$AppSecretName = "meta-facebook-app-secret"
 )
 
 $ErrorActionPreference = "Stop"
@@ -25,35 +22,37 @@ Set-Location $PSScriptRoot
 if (-not (Test-Path -LiteralPath ".\Dockerfile")) {
     throw "Dockerfile not found in $PSScriptRoot"
 }
-if (-not (Test-Path -LiteralPath ".\vdp_mcp_server.py")) {
-    throw "vdp_mcp_server.py not found in $PSScriptRoot"
+if (-not (Test-Path -LiteralPath ".\meta_mcp_server.py")) {
+    throw "meta_mcp_server.py not found in $PSScriptRoot"
 }
 
-function Get-ServiceRoleKey {
-    if ($SecretFile -and (Test-Path -LiteralPath $SecretFile)) {
-        return (Get-Content -LiteralPath $SecretFile -Raw).Trim()
-    }
-
+function Get-EnvValue([string]$Key) {
     $envPath = Join-Path $PSScriptRoot ".env"
-    if (Test-Path -LiteralPath $envPath) {
-        foreach ($line in Get-Content -LiteralPath $envPath) {
-            $t = $line.Trim()
-            if ($t -match '^\s*#' -or $t -eq "") { continue }
-            if ($t -match '^(?:export\s+)?SUPABASE_SERVICE_ROLE_KEY\s*=\s*(.*)$') {
-                $val = $Matches[1].Trim().Trim('"').Trim("'")
-                if ($val) { return $val }
-            }
+    if (-not (Test-Path -LiteralPath $envPath)) { return "" }
+    foreach ($line in Get-Content -LiteralPath $envPath) {
+        $t = $line.Trim()
+        if ($t -match '^\s*#' -or $t -eq "") { continue }
+        if ($t -match "^(?:export\s+)?$Key\s*=\s*(.*)$") {
+            return $Matches[1].Trim().Trim('"').Trim("'")
         }
     }
+    return ""
+}
 
-    Write-Host "Paste SUPABASE_SERVICE_ROLE_KEY (input hidden), then Enter:"
-    $secure = Read-Host -AsSecureString
-    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+function Ensure-Secret([string]$Name, [string]$Value) {
+    if (-not $Value) { throw "Secret value for $Name is empty. Set it in .env" }
+    $tmp = Join-Path $env:TEMP "meta-secret-$([guid]::NewGuid().ToString('N')).txt"
     try {
-        return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr).Trim()
-    }
-    finally {
-        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+        Set-Content -LiteralPath $tmp -Value $Value -NoNewline -Encoding utf8
+        $exists = $null
+        try { $exists = gcloud secrets describe $Name --project $ProjectId 2>$null } catch { $exists = $null }
+        if (-not $exists) {
+            gcloud secrets create $Name --project $ProjectId --replication-policy=automatic --data-file=$tmp
+        } else {
+            gcloud secrets versions add $Name --project $ProjectId --data-file=$tmp
+        }
+    } finally {
+        if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
     }
 }
 
@@ -68,40 +67,14 @@ gcloud services enable `
     artifactregistry.googleapis.com `
     --project $ProjectId
 
-$key = Get-ServiceRoleKey
-if (-not $key) {
-    throw "SUPABASE_SERVICE_ROLE_KEY is empty. Pass -SecretFile or set it in .env"
-}
+$appId = Get-EnvValue "FACEBOOK_APP_ID"
+$adAccount = Get-EnvValue "FACEBOOK_AD_ACCOUNT_ID"
+$appSecret = Get-EnvValue "FACEBOOK_APP_SECRET"
 
-$tmpSecret = Join-Path $env:TEMP "vdp-supabase-service-role-$([guid]::NewGuid().ToString('N')).txt"
-try {
-    Set-Content -LiteralPath $tmpSecret -Value $key -NoNewline -Encoding utf8
+if (-not $appId) { throw "FACEBOOK_APP_ID missing in .env" }
+if (-not $adAccount) { throw "FACEBOOK_AD_ACCOUNT_ID missing in .env" }
 
-    $secretExists = $null
-    try {
-        $secretExists = gcloud secrets describe $SecretName --project $ProjectId 2>$null
-    } catch {
-        $secretExists = $null
-    }
-
-    if (-not $secretExists) {
-        Write-Host "Creating secret $SecretName ..."
-        gcloud secrets create $SecretName `
-            --project $ProjectId `
-            --replication-policy=automatic `
-            --data-file=$tmpSecret
-    } else {
-        Write-Host "Adding new version to secret $SecretName ..."
-        gcloud secrets versions add $SecretName `
-            --project $ProjectId `
-            --data-file=$tmpSecret
-    }
-}
-finally {
-    if (Test-Path -LiteralPath $tmpSecret) {
-        Remove-Item -LiteralPath $tmpSecret -Force -ErrorAction SilentlyContinue
-    }
-}
+Ensure-Secret $AppSecretName $appSecret
 
 Write-Host "Building and deploying from source (Dockerfile)..."
 gcloud run deploy $Service `
@@ -109,9 +82,9 @@ gcloud run deploy $Service `
     --region $Region `
     --source . `
     --command python `
-    --args "vdp_mcp_server.py" `
-    --set-env-vars "MCP_TRANSPORT=http,HOST=0.0.0.0,SUPABASE_URL=$SupabaseUrl" `
-    --set-secrets "SUPABASE_SERVICE_ROLE_KEY=${SecretName}:latest" `
+    --args "meta_mcp_server.py" `
+    --set-env-vars "MCP_TRANSPORT=http,HOST=0.0.0.0,FACEBOOK_APP_ID=$appId,FACEBOOK_AD_ACCOUNT_ID=$adAccount" `
+    --set-secrets "FACEBOOK_APP_SECRET=${AppSecretName}:latest" `
     --allow-unauthenticated `
     --session-affinity `
     --max-instances 1 `
@@ -123,7 +96,6 @@ $url = gcloud run services describe $Service `
     --region $Region `
     --format="value(status.url)"
 
-# Claude OAuth discovery needs the public HTTPS origin as MCP_PUBLIC_URL.
 Write-Host "Setting MCP_PUBLIC_URL=$url for Claude OAuth discovery..."
 gcloud run services update $Service `
     --project $ProjectId `
@@ -131,17 +103,8 @@ gcloud run services update $Service `
     --update-env-vars "MCP_PUBLIC_URL=$url"
 
 Write-Host ""
-Write-Host "Deployed. MCP connector URL (use this exact path):"
+Write-Host "Deployed. MCP connector URL:"
 Write-Host "  $url/mcp"
 Write-Host ""
-Write-Host "Cursor mcp.json:"
-Write-Host ("  `"vdp`": { `"url`": `"$url/mcp`" }")
-Write-Host ""
-Write-Host "Claude.ai:"
-Write-Host "  Settings -> Connectors -> Add custom connector"
-Write-Host "  Name: VDP Report (or any name)"
-Write-Host "  URL:  $url/mcp"
-Write-Host "  Leave Advanced OAuth Client ID empty (server supports DCR)."
-Write-Host "  Click Connect — browser may briefly authorize, then tools appear."
-Write-Host ""
-Write-Host "Security note: service is publicly reachable; OAuth restricts tokens to Claude redirects."
+Write-Host 'Cursor mcp.json:'
+Write-Host ("  `"meta`": { `"url`": `"$url/mcp`" }")

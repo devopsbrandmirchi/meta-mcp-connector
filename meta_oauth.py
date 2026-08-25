@@ -1,5 +1,5 @@
 """
-Claude.ai-compatible OAuth 2.1 provider for the VDP MCP connector.
+Claude.ai-compatible OAuth 2.1 provider for the Meta MCP connector.
 
 Claude custom connectors require Dynamic Client Registration (DCR) and
 discovery at /.well-known/oauth-authorization-server. Without this, Claude
@@ -31,9 +31,9 @@ from mcp.server.auth.provider import (
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from pydantic import AnyUrl
 
-logger = logging.getLogger("vdp-oauth")
+logger = logging.getLogger("meta-oauth")
 
-DEFAULT_SCOPE = "vdp"
+DEFAULT_SCOPE = "meta"
 DEFAULT_ACCESS_TOKEN_EXPIRY = 30 * 24 * 60 * 60  # 30 days
 DEFAULT_ALLOWED_REDIRECT_DOMAINS = ("claude.ai", "claude.com", "localhost", "127.0.0.1")
 
@@ -113,7 +113,7 @@ class ClaudeOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         if not client.client_id:
             raise AuthorizeError(error="invalid_request", error_description="Missing client_id")
 
-        code = f"vac_{secrets.token_hex(24)}"
+        code = f"mac_{secrets.token_hex(24)}"
         self.auth_codes[code] = AuthorizationCode(
             code=code,
             client_id=client.client_id,
@@ -123,7 +123,7 @@ class ClaudeOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
             scopes=params.scopes or [self.scope],
             code_challenge=params.code_challenge,
             resource=params.resource,
-            subject="vdp-user",
+            subject="meta-user",
         )
         return construct_redirect_uri(redirect, code=code, state=params.state)
 
@@ -150,8 +150,8 @@ class ClaudeOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
 
         del self.auth_codes[authorization_code.code]
 
-        access = f"vat_{secrets.token_hex(32)}"
-        refresh = f"vrt_{secrets.token_hex(32)}"
+        access = f"mat_{secrets.token_hex(32)}"
+        refresh = f"mrt_{secrets.token_hex(32)}"
         expires_at = int(time.time()) + self.access_token_expiry_seconds
 
         self.access_tokens[access] = AccessToken(
@@ -214,8 +214,8 @@ class ClaudeOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
             self._access_to_refresh.pop(old_access, None)
 
         granted = scopes or refresh_token.scopes
-        access = f"vat_{secrets.token_hex(32)}"
-        new_refresh = f"vrt_{secrets.token_hex(32)}"
+        access = f"mat_{secrets.token_hex(32)}"
+        new_refresh = f"mrt_{secrets.token_hex(32)}"
         expires_at = int(time.time()) + self.access_token_expiry_seconds
 
         self.refresh_tokens.pop(refresh_token.token, None)

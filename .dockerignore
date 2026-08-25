@@ -7,8 +7,7 @@ __pycache__/
 .venv/
 venv/
 myenv/
-*.md
-deploy-cloudrun.ps1
 service-role.key
 *.secret
 secrets/
+_test_*.py

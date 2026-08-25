@@ -1,176 +1,144 @@
-# VDP MCP Connector
+# Meta MCP Connector
 
-Plain-language MCP for **Smart Analytics V2**  
-Supabase: https://rllwmeqingvuohyctddg.supabase.co
+Plain-language MCP server for **Meta / Facebook Ads** via the Graph API.
 
-Users ask in simple English. They do **not** need table names or client IDs.
+Ask about ad accounts, campaigns, ad sets, spend, and performance in natural language — no table names or raw API paths required.
 
-## What it maps (behind the scenes)
+## Features
 
-| User asks about | Tables used |
-|---|---|
-| Dealers | `smart_hoot_config` |
-| VDP KPIs / daily chart / make·model·location | `smart_final_data` |
-| All page views / channels / titles | `smart_ga4_page_data` |
-| Locations | `smart_dealer_locations` |
-| GA4 sync | `smart_ga4_config` |
-| VDP URL rules | `smart_vdp_logic` |
-| Inventory | `smart_hoot_inventory`, `smart_scrap_inventory` |
-| Who has access | `smart_user_roles` (+ related) |
+- Live data from the Facebook Marketing API (Graph API)
+- List ad accounts with parent Business Manager
+- Campaign / ad set / ad performance (spend, impressions, clicks, purchases)
+- Account-level spend dashboard (`account-spend.html`)
+- Claude.ai OAuth when deployed to Cloud Run (`MCP_PUBLIC_URL`)
+
+## Project structure
+
+```
+meta-mcp-connector/
+├── meta_mcp_server.py    # MCP server + HTTP routes + tools
+├── meta_graph.py         # Facebook Graph API client
+├── meta_oauth.py         # Claude-compatible OAuth provider
+├── account-spend.html    # Spend-by-account dashboard
+├── test-accounts.html    # Ad account list test page
+├── get-token.html        # Helper to obtain FACEBOOK_ACCESS_TOKEN
+├── requirements.txt
+├── Dockerfile
+├── deploy-cloudrun.ps1   # Deploy to Google Cloud Run
+├── .env.example
+└── .cursor/mcp.json      # Local Cursor MCP config (example)
+```
 
 ## Setup (local)
 
+### 1. Clone and install
+
 ```bash
-cd vdp-mcp-connector
+git clone https://github.com/YOUR_USERNAME/meta-mcp-connector.git
+cd meta-mcp-connector
 python -m venv .venv
-# Windows:
+
+# Windows
 .venv\Scripts\activate
+
 pip install -r requirements.txt
 copy .env.example .env
 ```
 
-1. Open [API settings](https://supabase.com/dashboard/project/rllwmeqingvuohyctddg/settings/api)
-2. Copy **service_role** secret into `.env` as `SUPABASE_SERVICE_ROLE_KEY`
-3. Start the server:
+### 2. Configure `.env`
+
+```env
+FACEBOOK_APP_ID=your_app_id
+FACEBOOK_APP_SECRET=your_app_secret
+FACEBOOK_ACCESS_TOKEN=your_user_token_with_ads_read
+FACEBOOK_AD_ACCOUNT_ID=114810198697538
+```
+
+**Token requirements**
+
+- Must be a **User Token** (`EAA…`), not an App Token (`app_id|secret`)
+- Generated in [Graph API Explorer](https://developers.facebook.com/tools/explorer/) for **your** `FACEBOOK_APP_ID`
+- Permissions: `ads_read`, `ads_management`, `business_management`
+
+Use `get-token.html` or run the server and open `http://127.0.0.1:8001/get-token`.
+
+### 3. Start the server
 
 ```bash
-python vdp_mcp_server.py --http
+python meta_mcp_server.py --http
 ```
 
-Listens on `http://127.0.0.1:8001/mcp`.
+| Endpoint | URL |
+|----------|-----|
+| MCP | `http://127.0.0.1:8001/mcp` |
+| Account spend UI | `http://127.0.0.1:8001/account-spend` |
+| Account list API | `http://127.0.0.1:8001/api/accounts` |
+| Account spend API | `http://127.0.0.1:8001/api/account-spend?date=YYYY-MM-DD` |
 
-### Cursor (local)
+### 4. Cursor MCP config
+
+`.cursor/mcp.json`:
 
 ```json
-"vdp": {
-  "url": "http://127.0.0.1:8001/mcp"
+{
+  "mcpServers": {
+    "meta": {
+      "url": "http://127.0.0.1:8001/mcp"
+    }
+  }
 }
 ```
 
-1. Keep this terminal running: `python vdp_mcp_server.py --http`  
-2. Cursor **Settings → MCP** → refresh / reload  
-3. **vdp** should show green with tools like `list_dealers`, `get_vdp_summary`, …
+Reload MCP in Cursor settings after starting the server.
 
-Then ask: “List dealers” or “VDP views for Moix RV last 7 days”.
+## MCP tools
 
-## Google Cloud Run
-
-Host the same HTTP MCP endpoint on Cloud Run (same pattern as the DV360 MCP connector). The image does **not** bake in `.env` or the service_role key.
-
-### Prerequisites
-
-- [Google Cloud SDK (`gcloud`)](https://cloud.google.com/sdk/docs/install) installed and logged in (`gcloud auth login`)
-- A GCP project with **billing enabled**
-- Your GCP **Project ID**
-- Supabase **service_role** key ready (from [API settings](https://supabase.com/dashboard/project/rllwmeqingvuohyctddg/settings/api))
-
-### Deploy
-
-From this repo folder:
-
-```powershell
-# Option A: key already in local .env (not committed)
-.\deploy-cloudrun.ps1 -ProjectId "YOUR_GCP_PROJECT_ID"
-
-# Option B: key in a one-line file (gitignored)
-.\deploy-cloudrun.ps1 -ProjectId "YOUR_GCP_PROJECT_ID" -SecretFile ".\service-role.key"
-
-# Optional overrides
-.\deploy-cloudrun.ps1 -ProjectId "YOUR_GCP_PROJECT_ID" -Region "us-central1" -Service "vdp-mcp" -SecretName "vdp-supabase-service-role"
-```
-
-What the script does:
-
-1. Enables Cloud Run, Cloud Build, Secret Manager, Artifact Registry  
-2. Creates/updates Secret Manager secret `vdp-supabase-service-role` from `.env`, `-SecretFile`, or a prompt  
-3. Deploys with `--source .` (Dockerfile), env vars, and secret injection  
-4. Prints the connector URL: `https://SERVICE-URL/mcp`
-
-Deploy flags (mirrors DV360):
-
-- `--set-env-vars MCP_TRANSPORT=http,HOST=0.0.0.0,SUPABASE_URL=https://rllwmeqingvuohyctddg.supabase.co`
-- `--set-secrets SUPABASE_SERVICE_ROLE_KEY=vdp-supabase-service-role:latest`
-- `--allow-unauthenticated` (needed for a working MCP URL on first deploy)
-- `--session-affinity`, `--max-instances 1`, `--timeout 300`, `--port 8080`
-
-### Cursor (Cloud Run)
-
-After deploy, put the printed URL in `%USERPROFILE%\.cursor\mcp.json`:
-
-```json
-"vdp": {
-  "url": "https://YOUR-CLOUD-RUN-URL/mcp"
-}
-```
-
-Example (replace with your real service URL from `gcloud run services describe`):
-
-```json
-"vdp": {
-  "url": "https://vdp-mcp-xxxxx-uc.a.run.app/mcp"
-}
-```
-
-Refresh MCP in Cursor until **vdp** is green. You do **not** need a local `python vdp_mcp_server.py` process when using Cloud Run.
-
-### Claude custom connector
-
-Claude.ai **requires OAuth** for remote custom connectors. This server embeds a Claude-compatible OAuth provider (Dynamic Client Registration) when `MCP_PUBLIC_URL` is set (the deploy script sets it automatically).
-
-1. Deploy with `.\deploy-cloudrun.ps1 -ProjectId "YOUR_GCP_PROJECT_ID"`
-2. Remove any old broken connector named “VDP Report”
-3. **Settings → Connectors → Add custom connector**
-4. Paste **exactly**: `https://YOUR-CLOUD-RUN-URL/mcp` (must include `/mcp`)
-5. Leave **OAuth Client ID** empty in Advanced settings (DCR is enabled)
-6. Click Connect — Claude registers itself and authorizes briefly
-
-If you still see *“Couldn't register with … sign-in service”* (`ofid_…`):
-
-- Confirm the URL ends with `/mcp` (not the bare Cloud Run host)
-- Confirm the service is up: open `https://YOUR-CLOUD-RUN-URL/.well-known/oauth-authorization-server` — you should see JSON with `registration_endpoint`
-- Confirm `MCP_PUBLIC_URL` matches the service origin (redeploy if you changed the URL)
-- Do **not** paste a random Google/OAuth Client ID unless you set up an external IdP
-
-### Local vs Cloud
-
-| | Local | Cloud Run |
-|---|---|---|
-| Start | `python vdp_mcp_server.py --http` | `.\deploy-cloudrun.ps1 -ProjectId ...` |
-| URL | `http://127.0.0.1:8001/mcp` | `https://…run.app/mcp` |
-| Secrets | `.env` file | Secret Manager → `SUPABASE_SERVICE_ROLE_KEY` |
-| Host / port | `127.0.0.1:8001` | `0.0.0.0` + `PORT=8080` |
-| Claude OAuth | Off (no `MCP_PUBLIC_URL`) | On (`MCP_PUBLIC_URL` = service URL) |
-| Tools | Same | Same |
-
-### Security note
-
-`--allow-unauthenticated` makes the Cloud Run URL publicly reachable. OAuth means Claude must complete registration/authorize before tools work; random callers without a token get `401`. Still treat the URL as sensitive and add stronger auth before sharing widely.
+| Tool | Purpose |
+|------|---------|
+| `help_meta` | What you can ask |
+| `list_accounts` | Ad accounts + parent Business Manager |
+| `list_campaigns` | Campaigns in an ad account |
+| `list_adsets` | Ad sets in an ad account |
+| `get_integration_status` | Token / app health check |
+| `get_ads_summary` | KPI totals for a date range |
+| `get_daily_trend` | Day-by-day spend & metrics |
+| `get_performance_breakdown` | Breakdown by campaign / ad set / placement |
+| `get_top_ads` | Top ads by spend or other metric |
 
 ## Example prompts
 
-- "List RV dealers"
-- "VDP views for Moix RV from 2026-08-01 to 2026-08-17"
-- "Daily VDP trend for Zoomers RV last week"
-- "Break down VDP by make for Beaver Coach Sales"
-- "Which channels drove VDP traffic for A&L RV?"
-- "Top VDP pages for Gerzeny’s RV"
-- "Search inventory for Forest River at Moix"
-- "Show VDP URL rules for Beaver Coach"
-- "Is GA4 sync OK for Moix RV?"
+- "List my Meta ad accounts"
+- "Meta ads summary from 2026-08-01 to 2026-08-15"
+- "Daily spend last 7 days for WOW Ad Account"
+- "Top ads by spend yesterday"
+- "Break down spend by campaign last week"
 
-## Tools
+## Google Cloud Run
 
-| Tool | Purpose |
-|---|---|
-| `help_vdp` | What you can ask |
-| `list_dealers` | Find dealers by name/category |
-| `list_locations` | Rooftops / locations |
-| `get_vdp_summary` | VDP KPI totals |
-| `get_daily_trend` | Day-by-day VDP chart data |
-| `get_vdp_breakdown` | By location / make / model / year / type / condition |
-| `get_channel_mix` | Channel / traffic mix |
-| `get_top_pages` | Top paths & titles |
-| `search_inventory` | Hoot + scrap inventory |
-| `get_page_rules` | VDP/SRP filtration logic |
-| `get_ga4_sync_status` | Sync health |
-| `list_user_access` | Role assignments |
+```powershell
+.\deploy-cloudrun.ps1 -ProjectId "YOUR_GCP_PROJECT_ID"
+```
+
+Secrets: `FACEBOOK_APP_SECRET` in Secret Manager.  
+Env vars: `FACEBOOK_APP_ID`, `FACEBOOK_AD_ACCOUNT_ID`, `MCP_PUBLIC_URL` (set automatically).
+
+After deploy, use `https://YOUR-SERVICE-URL/mcp` in Cursor or Claude custom connectors.
+
+## Push to a new GitHub repo
+
+```powershell
+# Sign in to your new GitHub account first
+git credential-manager github login --force
+
+# Create repo on GitHub (browser or gh), then:
+git remote add origin https://github.com/YOUR_USERNAME/meta-mcp-connector.git
+git add .
+git commit -m "Initial commit: Meta MCP connector"
+git push -u origin main
+```
+
+## Security
+
+- Never commit `.env` — it is gitignored
+- `FACEBOOK_ACCESS_TOKEN` is a secret; rotate if exposed
+- Cloud Run deploy uses `--allow-unauthenticated` for MCP URL reachability; OAuth protects tool access when `MCP_PUBLIC_URL` is set
