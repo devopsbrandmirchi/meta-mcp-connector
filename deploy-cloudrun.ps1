@@ -132,6 +132,7 @@ gcloud run deploy $Service `
     --set-secrets $secretsArg `
     --allow-unauthenticated `
     --session-affinity `
+    --min-instances 1 `
     --max-instances 1 `
     --timeout 300 `
     --port 8080

@@ -185,12 +185,22 @@ If you see *"Couldn't register with … sign-in service"* (`ofid_…`):
 - Confirm `MCP_PUBLIC_URL` matches the service origin (redeploy if you changed the URL)
 - Do **not** paste a random OAuth Client ID unless you set up an external IdP
 
+If you see *"This connector has a server configuration issue"*:
+
+- **Redeploy** the latest code (fixes OAuth metadata for Claude: public-client DCR + `/mcp` protected-resource metadata)
+- **Remove** the old connector in Claude, then add it again (clears stale OAuth registration)
+- Verify health: `https://YOUR-CLOUD-RUN-URL/health` → `oauth_enabled: true`
+- Verify protected resource: `https://YOUR-CLOUD-RUN-URL/.well-known/oauth-protected-resource/mcp` → JSON (not 404)
+- Verify auth metadata includes `"none"` in `token_endpoint_auth_methods_supported`
+
 ### Verify deployment
 
 | Check | URL |
 |-------|-----|
+| Health | `https://YOUR-SERVICE-URL/health` |
 | MCP endpoint | `https://YOUR-SERVICE-URL/mcp` |
 | OAuth discovery | `https://YOUR-SERVICE-URL/.well-known/oauth-authorization-server` |
+| Protected resource | `https://YOUR-SERVICE-URL/.well-known/oauth-protected-resource/mcp` |
 | Account spend UI | `https://YOUR-SERVICE-URL/account-spend` |
 
 ### Local vs Cloud
@@ -212,9 +222,10 @@ If you see *"Couldn't register with … sign-in service"* (`ofid_…`):
 
 1. Claude URL missing `/mcp` → "Couldn't connect to the server"
 2. `MCP_PUBLIC_URL` not set → OAuth 404 → "Couldn't register with sign-in service"
-3. Committing `.env` or secret files
-4. Forgetting to redeploy after OAuth code changes
-5. Deploying without `FACEBOOK_ACCESS_TOKEN` → Graph API returns permission errors
+3. OAuth metadata missing `/mcp` protected resource or `"none"` auth method → "server configuration issue"
+4. Committing `.env` or secret files
+5. Forgetting to redeploy after OAuth code changes
+6. Deploying without `FACEBOOK_ACCESS_TOKEN` → Graph API returns permission errors
 
 ## Push to GitHub
 

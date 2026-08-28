@@ -92,16 +92,80 @@ def _resolve_public_url() -> str:
 
     if service and region and project_number:
         return f"https://{service}-{project_number}.{region}.run.app"
+    # Known Git → Cloud Run service until MCP_PUBLIC_URL is set explicitly.
+    if service == "meta-mcp-connector-git":
+        return "https://meta-mcp-connector-git-573223329822.us-central1.run.app"
     return ""
 
 
 MCP_PUBLIC_URL = _resolve_public_url()
 MCP_OAUTH_PASSWORD = os.environ.get("MCP_OAUTH_PASSWORD", "").strip() or None
+MCP_RESOURCE_URL = f"{MCP_PUBLIC_URL}/mcp" if MCP_PUBLIC_URL else ""
+
+
+def _patch_claude_oauth_compat(scope: str = "meta") -> None:
+    """
+    Claude.ai MCP OAuth requirements (see anthropics/claude-ai-mcp issues #5, #82, #214):
+
+    1. Advertise token_endpoint_auth_methods_supported including \"none\".
+    2. Treat DCR clients as public (PKCE) even when they request client_secret_post.
+    3. Expose scopes_supported in authorization-server metadata.
+    """
+    import json
+
+    import mcp.server.auth.handlers.register as register_mod
+    import mcp.server.auth.routes as auth_routes
+
+    if getattr(auth_routes, "_meta_claude_patch", False):
+        return
+
+    original_build = auth_routes.build_metadata
+
+    def build_metadata(*args, **kwargs):
+        metadata = original_build(*args, **kwargs)
+        methods = list(metadata.token_endpoint_auth_methods_supported or [])
+        if "none" not in methods:
+            methods.insert(0, "none")
+        metadata.token_endpoint_auth_methods_supported = methods
+        if not metadata.scopes_supported:
+            metadata.scopes_supported = [scope]
+        return metadata
+
+    auth_routes.build_metadata = build_metadata
+
+    original_handle = register_mod.RegistrationHandler.handle
+
+    async def handle(self, request):
+        try:
+            body = await request.body()
+            data = json.loads(body)
+            if data.get("token_endpoint_auth_method") in (
+                None,
+                "client_secret_post",
+                "client_secret_basic",
+            ):
+                data["token_endpoint_auth_method"] = "none"
+            from starlette.requests import Request as StarletteRequest
+
+            patched = json.dumps(data).encode()
+
+            async def receive():
+                return {"type": "http.request", "body": patched, "more_body": False}
+
+            request = StarletteRequest(request.scope, receive)
+        except Exception:
+            pass
+        return await original_handle(self, request)
+
+    register_mod.RegistrationHandler.handle = handle
+    auth_routes._meta_claude_patch = True
 
 
 def _build_mcp():
     if not MCP_PUBLIC_URL:
         return FastMCP("meta")
+
+    _patch_claude_oauth_compat()
 
     from pydantic import AnyHttpUrl
 
@@ -114,9 +178,11 @@ def _build_mcp():
         password=MCP_OAUTH_PASSWORD,
     )
     # valid_scopes=None → accept whatever Claude sends during DCR (avoids ofid_ register failures).
+    # resource_server_url MUST be the MCP path (/mcp) so RFC 9728 metadata is served at
+    # /.well-known/oauth-protected-resource/mcp (Claude uses the connector URL as the resource).
     auth = AuthSettings(
         issuer_url=AnyHttpUrl(MCP_PUBLIC_URL),
-        resource_server_url=AnyHttpUrl(MCP_PUBLIC_URL),
+        resource_server_url=AnyHttpUrl(MCP_RESOURCE_URL),
         client_registration_options=ClientRegistrationOptions(
             enabled=True,
             valid_scopes=None,
@@ -724,12 +790,24 @@ async def health_check(request):
     """Public health check (no auth) — used to verify Cloud Run / OAuth readiness."""
     from starlette.responses import JSONResponse
 
+    oauth_ready = bool(MCP_PUBLIC_URL)
     return JSONResponse(
         {
             "status": "ok",
             "service": "meta",
-            "oauth_enabled": bool(MCP_PUBLIC_URL),
+            "oauth_enabled": oauth_ready,
             "public_url": MCP_PUBLIC_URL or None,
+            "mcp_url": MCP_RESOURCE_URL or None,
+            "oauth_discovery": (
+                f"{MCP_PUBLIC_URL}/.well-known/oauth-authorization-server"
+                if oauth_ready
+                else None
+            ),
+            "protected_resource_metadata": (
+                f"{MCP_PUBLIC_URL}/.well-known/oauth-protected-resource/mcp"
+                if oauth_ready
+                else None
+            ),
         }
     )
 
