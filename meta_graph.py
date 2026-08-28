@@ -114,6 +114,22 @@ def normalize_insight_row(row: dict[str, Any]) -> dict[str, Any]:
         "region": row.get("region") or "",
         "country": row.get("country") or "",
         "dma": row.get("dma") or "",
+        # Demographic / hourly breakdowns
+        "age": row.get("age") or "",
+        "gender": row.get("gender") or "",
+        "hourly_stats_aggregated_by_advertiser_time_zone": row.get(
+            "hourly_stats_aggregated_by_advertiser_time_zone"
+        )
+        or "",
+        "hourly_stats_aggregated_by_audience_time_zone": row.get(
+            "hourly_stats_aggregated_by_audience_time_zone"
+        )
+        or "",
+        "hour": (
+            row.get("hourly_stats_aggregated_by_advertiser_time_zone")
+            or row.get("hourly_stats_aggregated_by_audience_time_zone")
+            or ""
+        ),
         "amount_spent_usd": float(row.get("spend") or 0),
         "impressions": int(float(row.get("impressions") or 0)),
         "reach": int(float(row.get("reach") or 0)),
@@ -640,7 +656,11 @@ class MetaGraphClient:
     ) -> list[dict[str, Any]]:
         act = self.resolve_account_id(account_id)
         params: dict[str, Any] = {
-            "fields": "id,name,status,objective",
+            "fields": (
+                "id,name,status,effective_status,objective,"
+                "daily_budget,lifetime_budget,budget_remaining,"
+                "bid_strategy,start_time,stop_time"
+            ),
             "limit": min(max(limit, 1), 200),
         }
         if search.strip():
@@ -661,7 +681,12 @@ class MetaGraphClient:
     ) -> list[dict[str, Any]]:
         act = self.resolve_account_id(account_id)
         params: dict[str, Any] = {
-            "fields": "id,name,status,campaign_id",
+            "fields": (
+                "id,name,status,effective_status,campaign_id,"
+                "daily_budget,lifetime_budget,budget_remaining,"
+                "optimization_goal,billing_event,bid_amount,"
+                "targeting,start_time,end_time"
+            ),
             "limit": min(max(limit, 1), 200),
         }
         if search.strip():
@@ -676,6 +701,220 @@ class MetaGraphClient:
             )
         rows = self._paginate(f"act_{act}/adsets", params)
         return rows[:limit] if limit else rows
+
+    def list_ad_creatives(
+        self,
+        account_id: str = "",
+        search: str = "",
+        limit: int = 50,
+        *,
+        include_preview: bool = True,
+    ) -> list[dict[str, Any]]:
+        """List ads with creative thumbnail / preview info."""
+        act = self.resolve_account_id(account_id)
+        params: dict[str, Any] = {
+            "fields": (
+                "id,name,status,effective_status,adset_id,campaign_id,"
+                "creative{id,name,thumbnail_url,image_url,object_type,"
+                "title,body,call_to_action_type,link_url,video_id}"
+            ),
+            "limit": min(max(limit, 1), 100),
+        }
+        if search.strip():
+            params["filtering"] = json.dumps(
+                [
+                    {
+                        "field": "name",
+                        "operator": "CONTAIN",
+                        "value": search.strip(),
+                    }
+                ]
+            )
+        rows = self._paginate(f"act_{act}/ads", params)
+        out: list[dict[str, Any]] = []
+        for row in rows[:limit]:
+            creative = row.get("creative") if isinstance(row.get("creative"), dict) else {}
+            ad_id = str(row.get("id") or "")
+            preview_url = ""
+            if include_preview and ad_id:
+                try:
+                    prev = self._graph_get(
+                        f"{ad_id}/previews",
+                        {"ad_format": "DESKTOP_FEED_STANDARD"},
+                    )
+                    bodies = prev.get("data") or []
+                    if bodies:
+                        # iframe HTML; extract src if present
+                        html = bodies[0].get("body") or ""
+                        preview_url = html
+                        if 'src="' in html:
+                            preview_url = html.split('src="', 1)[1].split('"', 1)[0]
+                except MetaGraphError:
+                    preview_url = ""
+            out.append(
+                {
+                    "ad_id": ad_id,
+                    "ad_name": row.get("name") or "",
+                    "status": row.get("effective_status") or row.get("status") or "",
+                    "adset_id": row.get("adset_id") or "",
+                    "campaign_id": row.get("campaign_id") or "",
+                    "creative_id": creative.get("id") or "",
+                    "creative_name": creative.get("name") or "",
+                    "thumbnail_url": creative.get("thumbnail_url") or "",
+                    "image_url": creative.get("image_url") or "",
+                    "title": creative.get("title") or "",
+                    "body": creative.get("body") or "",
+                    "cta": creative.get("call_to_action_type") or "",
+                    "link_url": creative.get("link_url") or "",
+                    "video_id": creative.get("video_id") or "",
+                    "preview_url": preview_url,
+                    "ads_manager_url": (
+                        f"https://www.facebook.com/adsmanager/manage/ads"
+                        f"?act={act}&selected_ad_ids={ad_id}"
+                        if ad_id
+                        else ""
+                    ),
+                }
+            )
+        return out
+
+    def get_adset_targeting(
+        self, account_id: str = "", search: str = "", limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """Return ad sets with a readable targeting summary."""
+        rows = self.list_adset_objects(
+            account_id=account_id, search=search, limit=limit
+        )
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            targeting = row.get("targeting") if isinstance(row.get("targeting"), dict) else {}
+            out.append(
+                {
+                    "adset_id": row.get("id") or "",
+                    "adset_name": row.get("name") or "",
+                    "status": row.get("effective_status") or row.get("status") or "",
+                    "campaign_id": row.get("campaign_id") or "",
+                    "optimization_goal": row.get("optimization_goal") or "",
+                    "targeting_summary": self._summarize_targeting(targeting),
+                    "targeting": targeting,
+                }
+            )
+        return out
+
+    @staticmethod
+    def _summarize_targeting(targeting: dict[str, Any]) -> str:
+        if not targeting:
+            return "(no targeting)"
+        parts: list[str] = []
+        age_min = targeting.get("age_min")
+        age_max = targeting.get("age_max")
+        if age_min or age_max:
+            parts.append(f"age {age_min or '?'}-{age_max or '?'}")
+        genders = targeting.get("genders")
+        if genders:
+            gmap = {1: "male", 2: "female"}
+            parts.append(
+                "gender "
+                + ",".join(gmap.get(int(g), str(g)) for g in genders)
+            )
+        geos = targeting.get("geo_locations") or {}
+        countries = geos.get("countries") or []
+        regions = geos.get("regions") or []
+        cities = geos.get("cities") or []
+        if countries:
+            parts.append("countries " + ",".join(str(c) for c in countries[:8]))
+        if regions:
+            names = [
+                (r.get("name") if isinstance(r, dict) else str(r)) for r in regions[:6]
+            ]
+            parts.append("regions " + ",".join(names))
+        if cities:
+            names = [
+                (c.get("name") if isinstance(c, dict) else str(c)) for c in cities[:6]
+            ]
+            parts.append("cities " + ",".join(names))
+        for key, label in (
+            ("flexible_spec", "interests/behaviors"),
+            ("interests", "interests"),
+            ("behaviors", "behaviors"),
+            ("custom_audiences", "custom audiences"),
+            ("excluded_custom_audiences", "excluded audiences"),
+            ("publisher_platforms", "platforms"),
+            ("facebook_positions", "FB positions"),
+            ("instagram_positions", "IG positions"),
+            ("device_platforms", "devices"),
+        ):
+            val = targeting.get(key)
+            if not val:
+                continue
+            if key == "flexible_spec" and isinstance(val, list):
+                names: list[str] = []
+                for block in val[:3]:
+                    if not isinstance(block, dict):
+                        continue
+                    for k in ("interests", "behaviors", "life_events", "family_statuses"):
+                        for item in block.get(k) or []:
+                            if isinstance(item, dict) and item.get("name"):
+                                names.append(str(item["name"]))
+                if names:
+                    parts.append(f"{label}: " + ", ".join(names[:10]))
+            elif isinstance(val, list):
+                names = []
+                for item in val[:8]:
+                    if isinstance(item, dict):
+                        names.append(str(item.get("name") or item.get("id") or item))
+                    else:
+                        names.append(str(item))
+                parts.append(f"{label}: " + ", ".join(names))
+        return "; ".join(parts) if parts else json.dumps(targeting)[:240]
+
+    @staticmethod
+    def _budget_display(raw: Any) -> str:
+        """Meta budgets are in account currency minor units (cents)."""
+        try:
+            cents = float(raw)
+        except (TypeError, ValueError):
+            return ""
+        if cents <= 0:
+            return ""
+        return f"{cents / 100:,.2f}"
+
+    def list_campaign_budgets(
+        self, account_id: str = "", search: str = "", limit: int = 50
+    ) -> list[dict[str, Any]]:
+        rows = self.list_campaign_objects(
+            account_id=account_id, search=search, limit=limit
+        )
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            out.append(
+                {
+                    "campaign_id": row.get("id") or "",
+                    "campaign_name": row.get("name") or "",
+                    "status": row.get("status") or "",
+                    "effective_status": row.get("effective_status") or "",
+                    "objective": row.get("objective") or "",
+                    "daily_budget": self._budget_display(row.get("daily_budget")),
+                    "lifetime_budget": self._budget_display(row.get("lifetime_budget")),
+                    "budget_remaining": self._budget_display(row.get("budget_remaining")),
+                    "bid_strategy": row.get("bid_strategy") or "",
+                    "start_time": row.get("start_time") or "",
+                    "stop_time": row.get("stop_time") or "",
+                }
+            )
+        return out
+
+    def update_object_status(
+        self, object_id: str, status: str
+    ) -> dict[str, Any]:
+        """Pause or activate a campaign / ad set / ad (needs ads_management)."""
+        oid = (object_id or "").strip()
+        if not oid:
+            raise MetaGraphError("object_id is required")
+        desired = (status or "").strip().upper()
+        if desired not in ("ACTIVE", "PAUSED"):
+            raise MetaGraphError("status must be ACTIVE or PAUSED")
+        return self._graph_post(oid, {"status": desired})
 
     def debug_token(self, *, input_token: Optional[str] = None) -> dict[str, Any]:
         """Inspect a token (defaults to the active connector token)."""

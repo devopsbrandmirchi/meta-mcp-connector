@@ -99,18 +99,35 @@ Reload MCP in Cursor settings after starting the server.
 | `list_accounts` | Ad accounts + parent Business Manager |
 | `list_campaigns` | Campaigns in an ad account |
 | `list_adsets` | Ad sets in an ad account |
+| `list_creatives` | Ads + creative thumbnails / preview URLs |
 | `get_integration_status` | Token / app health check |
 | `get_ads_summary` | KPI totals for a date range |
 | `get_daily_trend` | Day-by-day spend & metrics |
-| `get_performance_breakdown` | Breakdown by campaign / ad set / placement / **region·state** / country / DMA |
-| `get_conversions_by_region` | **Purchases & spend by state/region** (Meta `breakdowns=region`) |
+| `get_hourly_performance` | Hourly spend / clicks / purchases |
+| `get_performance_breakdown` | By campaign / adset / placement / region / age / gender / … |
+| `get_demographics_breakdown` | Age / gender / age×gender |
+| `get_conversions_by_region` | Purchases & spend by state/region |
+| `get_reach_frequency` | Reach & frequency (delivery pressure) |
 | `get_top_ads` | Top ads by spend or other metric |
+| `get_campaign_budgets` | Campaign budgets + status |
+| `set_object_status` | Pause / activate campaign, ad set, or ad (`ads_management`) |
+| `get_adset_targeting` | Who each ad set targets |
+| `get_multi_account_spend` | Spend rollup across all accounts |
 
 ## Example prompts
 
 - "List my Meta ad accounts"
+- "Spend across all accounts yesterday"
 - "Meta ads summary from 2026-08-01 to 2026-08-15"
 - "Daily spend last 7 days for WOW Ad Account"
+- "Hourly performance yesterday"
+- "Age and gender breakdown last week"
+- "Conversions by state for yesterday"
+- "Show creatives with preview URLs"
+- "Who does the Prospecting ad set target?"
+- "Campaign budgets and status"
+- "Pause campaign 120…" / "Activate campaign 120…"
+- "Reach and frequency by campaign this month"
 - "Top ads by spend yesterday"
 - "Break down spend by campaign last week"
 

@@ -426,18 +426,25 @@ def help_meta() -> str:
 
 ACCOUNTS
 - "List my Meta ad accounts"
+- "Spend across all accounts yesterday" (multi-account rollup)
 - "Is the Facebook integration configured?"
 
-CAMPAIGNS & AD SETS
+CAMPAIGNS, AD SETS & CREATIVES
 - "List campaigns for Drag Race"
 - "List ad sets"
+- "Show ads / creatives with preview URLs"
+- "Who does this ad set target?"
+- "Campaign budgets and status"
+- "Pause campaign X" / "Activate campaign X" (needs ads_management)
 
 PERFORMANCE (live from Facebook Graph API)
 - "Meta ads summary from 2026-08-01 to 2026-08-15"
 - "Daily spend and impressions last 7 days"
-- "Break down spend by campaign / ad set / ad / platform / placement"
-- "Break down by region / state / country / DMA"
+- "Hourly performance yesterday"
+- "Break down by campaign / ad set / ad / platform / placement"
+- "Break down by age / gender / region / state / country / DMA"
 - "Conversions by state for last 7 days"
+- "Reach and frequency by campaign"
 - "Top ads by spend this month"
 
 Data is fetched live — not from a database cache.
@@ -711,18 +718,27 @@ def get_performance_breakdown(
         "state": ("campaign", "region", "region"),
         "country": ("campaign", "country", "country"),
         "dma": ("campaign", "dma", "dma"),
+        "age": ("campaign", "age", "age"),
+        "gender": ("campaign", "gender", "gender"),
+        "age_gender": ("campaign", "age_gender", "age,gender"),
+        "demographics": ("campaign", "age_gender", "age,gender"),
     }
     key = (by or "campaign").strip().lower()
     spec = dim_map.get(key)
     if not spec:
         return (
             "Unknown breakdown. Use by=campaign|adset|ad|platform|placement|"
-            "region|state|country|dma."
+            "region|state|country|dma|age|gender|age_gender."
         )
 
     start, end = _date_range(start_date, end_date)
     level, col, breakdowns = spec
-    label = "state/region" if key in ("region", "state") else key
+    label = {
+        "region": "state/region",
+        "state": "state/region",
+        "age_gender": "age × gender",
+        "demographics": "age × gender",
+    }.get(key, key)
 
     rows = _fetch_insights(
         level=level,
@@ -742,6 +758,9 @@ def get_performance_breakdown(
                 f"{r.get('publisher_platform') or 'unknown'}/"
                 f"{r.get('platform_position') or 'unknown'}"
             )
+    if key in ("age_gender", "demographics"):
+        for r in rows:
+            r["age_gender"] = f"{r.get('age') or '?'}/{r.get('gender') or '?'}"
 
     if not rows:
         return f"No data for breakdown by {label} in that range."
@@ -936,6 +955,414 @@ def get_top_ads(
             ["Ad", "Ad set", "Spend", "Impressions", "Clicks", "Purchases"], table
         )
     )
+
+
+@mcp.tool()
+def list_creatives(
+    search: str = "",
+    account_id: str = "",
+    limit: int = 25,
+) -> str:
+    """List ads with creative thumbnails, preview URLs, and Ads Manager links."""
+    rows = _fb().list_ad_creatives(
+        account_id=account_id,
+        search=search,
+        limit=max(1, min(limit, 100)),
+        include_preview=True,
+    )
+    if not rows:
+        return "No ads/creatives found."
+    body = [
+        [
+            (r.get("ad_name") or "")[:40],
+            r.get("ad_id") or "",
+            r.get("status") or "",
+            (r.get("title") or "")[:30],
+            r.get("cta") or "",
+            (r.get("thumbnail_url") or r.get("image_url") or "")[:60] or "—",
+            (r.get("preview_url") or r.get("ads_manager_url") or "")[:70] or "—",
+        ]
+        for r in rows
+    ]
+    return (
+        f"Found {len(rows)} ad creative(s).\n"
+        + _table_lines(
+            ["Ad", "Ad ID", "Status", "Title", "CTA", "Thumbnail", "Preview / Ads Manager"],
+            body,
+        )
+    )
+
+
+@mcp.tool()
+def get_demographics_breakdown(
+    start_date: str,
+    end_date: str = "",
+    by: str = "age_gender",
+    campaign: str = "",
+    account_id: str = "",
+    limit: int = 50,
+) -> str:
+    """Break down Meta ads performance by age, gender, or age×gender."""
+    key = (by or "age_gender").strip().lower().replace("-", "_").replace(" ", "_")
+    if key in ("demo", "demographics", "agegender"):
+        key = "age_gender"
+    if key not in ("age", "gender", "age_gender"):
+        return "Unknown demographic. Use by=age|gender|age_gender."
+
+    breakdowns = "age,gender" if key == "age_gender" else key
+    start, end = _date_range(start_date, end_date)
+    rows = _fetch_insights(
+        level="campaign",
+        start=start,
+        end=end,
+        account_id=account_id,
+        breakdowns=breakdowns,
+        campaign=campaign,
+        time_increment="all_days",
+    )
+    if campaign.strip() and not _fb().resolve_campaign_id(account_id, campaign):
+        rows = _filter_rows(rows, campaign=campaign)
+    if not rows:
+        return f"No demographic data ({key}) in that range."
+
+    for r in rows:
+        if key == "age_gender":
+            r["bucket"] = f"{r.get('age') or '?'}/{r.get('gender') or '?'}"
+        else:
+            r["bucket"] = str(r.get(key) or "(unknown)")
+
+    buckets = _aggregate_metrics(rows, group_by="bucket")
+    ranked = sorted(
+        buckets.items(),
+        key=lambda kv: kv[1]["amount_spent_usd"],
+        reverse=True,
+    )[: max(1, min(limit, 200))]
+    table = [
+        [
+            name,
+            _fmt_usd(v["amount_spent_usd"]),
+            _fmt_int(v["impressions"]),
+            _fmt_int(v["reach"]),
+            _fmt_int(v["clicks_all"]),
+            _fmt_int(v["purchases"]),
+        ]
+        for name, v in ranked
+    ]
+    return (
+        f"Demographics by {key} (Graph API)\n"
+        f"{start.isoformat()} to {end.isoformat()}\n"
+        + _table_lines(
+            [key.replace("_", " × ").title(), "Spend", "Impressions", "Reach", "Clicks", "Purchases"],
+            table,
+        )
+    )
+
+
+@mcp.tool()
+def get_hourly_performance(
+    start_date: str,
+    end_date: str = "",
+    campaign: str = "",
+    account_id: str = "",
+    timezone: str = "advertiser",
+) -> str:
+    """Hourly Meta ads performance (advertiser or audience timezone)."""
+    tz = (timezone or "advertiser").strip().lower()
+    if tz in ("audience", "user"):
+        breakdown = "hourly_stats_aggregated_by_audience_time_zone"
+        label = "audience timezone"
+    else:
+        breakdown = "hourly_stats_aggregated_by_advertiser_time_zone"
+        label = "advertiser timezone"
+
+    start, end = _date_range(start_date, end_date)
+    rows = _fetch_insights(
+        level="campaign",
+        start=start,
+        end=end,
+        account_id=account_id,
+        breakdowns=breakdown,
+        campaign=campaign,
+        time_increment="all_days",
+    )
+    if campaign.strip() and not _fb().resolve_campaign_id(account_id, campaign):
+        rows = _filter_rows(rows, campaign=campaign)
+    if not rows:
+        return f"No hourly data ({label}) in that range."
+
+    buckets = _aggregate_metrics(rows, group_by="hour")
+    ranked = sorted(buckets.items(), key=lambda kv: kv[0])
+    table = [
+        [
+            hour or "(unknown)",
+            _fmt_usd(v["amount_spent_usd"]),
+            _fmt_int(v["impressions"]),
+            _fmt_int(v["clicks_all"]),
+            _fmt_int(v["purchases"]),
+        ]
+        for hour, v in ranked
+    ]
+    return (
+        f"Hourly performance ({label}, Graph API)\n"
+        f"{start.isoformat()} to {end.isoformat()}\n"
+        + _table_lines(["Hour", "Spend", "Impressions", "Clicks", "Purchases"], table)
+    )
+
+
+@mcp.tool()
+def get_campaign_budgets(
+    search: str = "",
+    account_id: str = "",
+    limit: int = 50,
+) -> str:
+    """List campaign budgets and delivery status (daily / lifetime / remaining)."""
+    rows = _fb().list_campaign_budgets(
+        account_id=account_id, search=search, limit=max(1, min(limit, 200))
+    )
+    if not rows:
+        return "No campaigns found."
+    body = [
+        [
+            (r.get("campaign_name") or "")[:40],
+            r.get("campaign_id") or "",
+            r.get("effective_status") or r.get("status") or "",
+            r.get("daily_budget") or "—",
+            r.get("lifetime_budget") or "—",
+            r.get("budget_remaining") or "—",
+            r.get("objective") or "",
+        ]
+        for r in rows
+    ]
+    return (
+        f"Found {len(rows)} campaign budget row(s). Amounts are in account currency.\n"
+        + _table_lines(
+            ["Campaign", "ID", "Status", "Daily", "Lifetime", "Remaining", "Objective"],
+            body,
+        )
+    )
+
+
+@mcp.tool()
+def set_object_status(
+    object_id: str,
+    status: str,
+) -> str:
+    """
+    Pause or activate a Meta campaign, ad set, or ad.
+
+    Requires FACEBOOK_ACCESS_TOKEN with ads_management.
+    status must be ACTIVE or PAUSED. Pass the Graph object id (campaign/adset/ad).
+    """
+    desired = (status or "").strip().upper()
+    oid = (object_id or "").strip()
+    if not oid:
+        return "object_id is required (campaign, ad set, or ad id)."
+    if desired not in ("ACTIVE", "PAUSED"):
+        return "status must be ACTIVE or PAUSED."
+    try:
+        result = _fb().update_object_status(oid, desired)
+    except MetaGraphError as e:
+        return (
+            f"Failed to set status: {e}\n"
+            "Ensure FACEBOOK_ACCESS_TOKEN has ads_management permission."
+        )
+    ok = result.get("success")
+    return (
+        f"Updated object {oid} → {desired}."
+        + (" (success)" if ok is True else f" Response: {result}")
+    )
+
+
+@mcp.tool()
+def get_adset_targeting(
+    search: str = "",
+    account_id: str = "",
+    limit: int = 25,
+) -> str:
+    """Show who each ad set targets (age, geo, interests, audiences, placements)."""
+    rows = _fb().get_adset_targeting(
+        account_id=account_id, search=search, limit=max(1, min(limit, 100))
+    )
+    if not rows:
+        return "No ad sets found."
+    body = [
+        [
+            (r.get("adset_name") or "")[:35],
+            r.get("adset_id") or "",
+            r.get("status") or "",
+            r.get("optimization_goal") or "",
+            (r.get("targeting_summary") or "")[:120],
+        ]
+        for r in rows
+    ]
+    return (
+        f"Found {len(rows)} ad set targeting row(s).\n"
+        + _table_lines(
+            ["Ad set", "ID", "Status", "Optimization", "Targeting"],
+            body,
+        )
+    )
+
+
+@mcp.tool()
+def get_reach_frequency(
+    start_date: str,
+    end_date: str = "",
+    by: str = "campaign",
+    campaign: str = "",
+    account_id: str = "",
+    limit: int = 25,
+) -> str:
+    """
+    Reach and frequency reporting (frequency caps / delivery pressure).
+
+    Note: reach is not additive across rows — totals are approximate when broken down.
+    """
+    key = (by or "campaign").strip().lower()
+    level_map = {
+        "account": ("account", "campaign_name"),
+        "campaign": ("campaign", "campaign_name"),
+        "adset": ("adset", "adset_name"),
+        "ad": ("ad", "ad_name"),
+    }
+    if key not in level_map:
+        return "Unknown level. Use by=account|campaign|adset|ad."
+    level, col = level_map[key]
+    if key == "account":
+        col = "account"
+
+    start, end = _date_range(start_date, end_date)
+    rows = _fetch_insights(
+        level=level if key != "account" else "account",
+        start=start,
+        end=end,
+        account_id=account_id,
+        campaign=campaign,
+        time_increment="all_days",
+    )
+    if campaign.strip() and not _fb().resolve_campaign_id(account_id, campaign):
+        rows = _filter_rows(rows, campaign=campaign)
+    if not rows:
+        return "No reach/frequency data in that range."
+
+    if key == "account":
+        for r in rows:
+            r["account"] = "Account total"
+
+    # Aggregate carefully: spend/impressions/clicks sum; reach/frequency use weighted avg.
+    buckets: dict[str, dict[str, float]] = defaultdict(
+        lambda: {
+            "amount_spent_usd": 0.0,
+            "impressions": 0.0,
+            "reach": 0.0,
+            "clicks_all": 0.0,
+            "purchases": 0.0,
+            "_freq_weight": 0.0,
+            "_freq_sum": 0.0,
+        }
+    )
+    for r in rows:
+        name = str(r.get(col) or "(unnamed)")
+        imps = float(r.get("impressions") or 0)
+        reach = float(r.get("reach") or 0)
+        freq = float(r.get("frequency") or 0)
+        buckets[name]["amount_spent_usd"] += float(r.get("amount_spent_usd") or 0)
+        buckets[name]["impressions"] += imps
+        buckets[name]["reach"] += reach
+        buckets[name]["clicks_all"] += float(r.get("clicks_all") or 0)
+        buckets[name]["purchases"] += float(r.get("purchases") or 0)
+        if freq > 0 and imps > 0:
+            buckets[name]["_freq_sum"] += freq * imps
+            buckets[name]["_freq_weight"] += imps
+
+    ranked = sorted(
+        buckets.items(),
+        key=lambda kv: kv[1]["impressions"],
+        reverse=True,
+    )[: max(1, min(limit, 100))]
+
+    table = []
+    for name, v in ranked:
+        imps = v["impressions"]
+        reach = v["reach"]
+        if v["_freq_weight"] > 0:
+            freq = v["_freq_sum"] / v["_freq_weight"]
+        elif reach > 0:
+            freq = imps / reach
+        else:
+            freq = 0.0
+        table.append(
+            [
+                name[:45],
+                _fmt_int(reach),
+                _fmt_float(freq, decimals=2),
+                _fmt_int(imps),
+                _fmt_usd(v["amount_spent_usd"]),
+                _fmt_int(v["purchases"]),
+            ]
+        )
+    return (
+        f"Reach & frequency by {key} (Graph API)\n"
+        f"{start.isoformat()} to {end.isoformat()}\n"
+        f"Note: reach is non-additive across rows when broken down.\n"
+        + _table_lines(
+            [key.title(), "Reach", "Frequency", "Impressions", "Spend", "Purchases"],
+            table,
+        )
+    )
+
+
+@mcp.tool()
+def get_multi_account_spend(
+    start_date: str = "yesterday",
+    end_date: str = "",
+    limit: int = 100,
+) -> str:
+    """Roll up spend across all accessible Meta ad accounts for a date range."""
+    start, end = _date_range(start_date, end_date or start_date)
+    rows = _fb().list_accounts_with_spend(
+        start, end, account_limit=max(1, min(limit, 500))
+    )
+    if not rows:
+        return "No ad accounts returned."
+    with_spend = [r for r in rows if float(r.get("spend") or 0) > 0]
+    total = sum(float(r.get("spend") or 0) for r in rows)
+    body = [
+        [
+            r.get("account_id") or "",
+            (r.get("name") or "")[:35],
+            (r.get("parent_business_name") or "—")[:25],
+            _fmt_usd(r.get("spend")),
+            _fmt_int(r.get("impressions")),
+            _fmt_int(r.get("clicks")),
+            r.get("currency") or "",
+        ]
+        for r in rows
+    ]
+    highest = with_spend[0] if with_spend else None
+    lowest = with_spend[-1] if with_spend else None
+    lines = [
+        f"Multi-account rollup (Graph API)",
+        f"{start.isoformat()} to {end.isoformat()}",
+        f"Accounts: {len(rows)} · With spend: {len(with_spend)} · Total spend: {_fmt_usd(total)}",
+    ]
+    if highest:
+        lines.append(
+            f"Highest: {highest.get('name')} ({highest.get('account_id')}) "
+            f"{_fmt_usd(highest.get('spend'))}"
+        )
+    if lowest and lowest is not highest:
+        lines.append(
+            f"Lowest (among spenders): {lowest.get('name')} ({lowest.get('account_id')}) "
+            f"{_fmt_usd(lowest.get('spend'))}"
+        )
+    lines.append(
+        _table_lines(
+            ["Account", "Name", "Parent", "Spend", "Impressions", "Clicks", "Currency"],
+            body,
+        )
+    )
+    return "\n".join(lines)
 
 
 def _cors_headers() -> dict[str, str]:
@@ -1184,12 +1611,20 @@ if __name__ == "__main__":
         "list_accounts",
         "list_campaigns",
         "list_adsets",
+        "list_creatives",
         "get_integration_status",
         "get_ads_summary",
         "get_daily_trend",
+        "get_hourly_performance",
         "get_performance_breakdown",
+        "get_demographics_breakdown",
         "get_conversions_by_region",
+        "get_reach_frequency",
         "get_top_ads",
+        "get_campaign_budgets",
+        "set_object_status",
+        "get_adset_targeting",
+        "get_multi_account_spend",
     ]
     print("Tools: " + ", ".join(tools), file=sys.stderr, flush=True)
 
