@@ -8,13 +8,21 @@ shows: "Couldn't register with … sign-in service" / ofid_…
 No external IdP — the MCP server is its own authorization server.
 Authorize auto-approves for allowed redirect hosts (claude.ai by default).
 Optional MCP_OAUTH_PASSWORD adds a simple login gate.
+
+OAuth clients / tokens are persisted to disk so Claude stays connected across
+Cloud Run restarts (min-instances=1) and browser reopen — without forcing a
+full reconnect every time.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import secrets
+import threading
 import time
+from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
 
@@ -48,6 +56,15 @@ CLAUDE_CIMD_URLS = (
 JWT_BEARER_GRANT = "urn:ietf:params:oauth:grant-type:jwt-bearer"
 
 
+def _default_state_path() -> str:
+    explicit = os.environ.get("MCP_OAUTH_STATE_PATH", "").strip()
+    if explicit:
+        return explicit
+    if os.environ.get("K_SERVICE"):
+        return "/tmp/meta-mcp-oauth-state.json"
+    return str(Path(__file__).resolve().parent / ".meta-oauth-state.json")
+
+
 class ClaudeOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshToken, AccessToken]):
     """Embedded AS with DCR + PKCE, tuned for Claude custom connectors."""
 
@@ -59,6 +76,7 @@ class ClaudeOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         allowed_redirect_domains: Optional[list[str]] = None,
         access_token_expiry_seconds: int = DEFAULT_ACCESS_TOKEN_EXPIRY,
         scope: str = DEFAULT_SCOPE,
+        state_path: Optional[str] = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.password = password
@@ -69,6 +87,8 @@ class ClaudeOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         )
         self.access_token_expiry_seconds = access_token_expiry_seconds
         self.scope = scope
+        self.state_path = state_path or _default_state_path()
+        self._lock = threading.Lock()
 
         self.clients: dict[str, OAuthClientInformationFull] = {}
         self.auth_codes: dict[str, AuthorizationCode] = {}
@@ -76,6 +96,8 @@ class ClaudeOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         self.refresh_tokens: dict[str, RefreshToken] = {}
         self._access_to_refresh: dict[str, str] = {}
         self._refresh_to_access: dict[str, str] = {}
+
+        self._load_state()
 
     def _is_redirect_allowed(self, redirect_uri: str) -> bool:
         try:
@@ -89,6 +111,77 @@ class ClaudeOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
             if host == d or host.endswith(f".{d}"):
                 return True
         return False
+
+    def _load_state(self) -> None:
+        path = Path(self.state_path)
+        if not path.is_file():
+            return
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Could not load OAuth state from %s: %s", path, exc)
+            return
+
+        now = time.time()
+        for client in raw.get("clients") or []:
+            try:
+                info = OAuthClientInformationFull.model_validate(client)
+                if info.client_id:
+                    self.clients[info.client_id] = info
+            except Exception as exc:
+                logger.warning("Skip bad OAuth client in state: %s", exc)
+
+        for item in raw.get("access_tokens") or []:
+            try:
+                tok = AccessToken.model_validate(item)
+                if tok.expires_at and tok.expires_at < now:
+                    continue
+                self.access_tokens[tok.token] = tok
+            except Exception:
+                pass
+
+        for item in raw.get("refresh_tokens") or []:
+            try:
+                tok = RefreshToken.model_validate(item)
+                if tok.expires_at and tok.expires_at < now:
+                    continue
+                self.refresh_tokens[tok.token] = tok
+            except Exception:
+                pass
+
+        for access, refresh in (raw.get("access_to_refresh") or {}).items():
+            if access in self.access_tokens and refresh in self.refresh_tokens:
+                self._access_to_refresh[access] = refresh
+                self._refresh_to_access[refresh] = access
+
+        logger.info(
+            "Loaded OAuth state from %s (%d clients, %d access, %d refresh)",
+            path,
+            len(self.clients),
+            len(self.access_tokens),
+            len(self.refresh_tokens),
+        )
+
+    def _save_state(self) -> None:
+        path = Path(self.state_path)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "saved_at": int(time.time()),
+                "clients": [c.model_dump(mode="json") for c in self.clients.values()],
+                "access_tokens": [
+                    t.model_dump(mode="json") for t in self.access_tokens.values()
+                ],
+                "refresh_tokens": [
+                    t.model_dump(mode="json") for t in self.refresh_tokens.values()
+                ],
+                "access_to_refresh": dict(self._access_to_refresh),
+            }
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload), encoding="utf-8")
+            tmp.replace(path)
+        except Exception as exc:
+            logger.warning("Could not persist OAuth state to %s: %s", path, exc)
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
         existing = self.clients.get(client_id)
@@ -140,7 +233,9 @@ class ClaudeOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
             token_endpoint_auth_method="none",
             scope=self.scope,
         )
-        self.clients[client_id] = client_info
+        with self._lock:
+            self.clients[client_id] = client_info
+            self._save_state()
         logger.info("Registered CIMD OAuth client %s", client_id)
         return client_info
 
@@ -148,7 +243,9 @@ class ClaudeOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         if not client_info.client_id:
             raise ValueError("No client_id provided")
         # Accept Claude's redirect URIs; reject unknown hosts at /authorize.
-        self.clients[client_info.client_id] = client_info
+        with self._lock:
+            self.clients[client_info.client_id] = client_info
+            self._save_state()
         logger.info("Registered OAuth client %s", client_info.client_id)
 
     async def authorize(self, client: OAuthClientInformationFull, params: AuthorizationParams) -> str:
@@ -219,23 +316,25 @@ class ClaudeOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         refresh = f"mrt_{secrets.token_hex(32)}"
         expires_at = int(time.time()) + self.access_token_expiry_seconds
 
-        self.access_tokens[access] = AccessToken(
-            token=access,
-            client_id=client.client_id,
-            scopes=authorization_code.scopes,
-            expires_at=expires_at,
-            resource=authorization_code.resource,
-            subject=authorization_code.subject,
-        )
-        self.refresh_tokens[refresh] = RefreshToken(
-            token=refresh,
-            client_id=client.client_id,
-            scopes=authorization_code.scopes,
-            expires_at=None,
-            subject=authorization_code.subject,
-        )
-        self._access_to_refresh[access] = refresh
-        self._refresh_to_access[refresh] = access
+        with self._lock:
+            self.access_tokens[access] = AccessToken(
+                token=access,
+                client_id=client.client_id,
+                scopes=authorization_code.scopes,
+                expires_at=expires_at,
+                resource=authorization_code.resource,
+                subject=authorization_code.subject,
+            )
+            self.refresh_tokens[refresh] = RefreshToken(
+                token=refresh,
+                client_id=client.client_id,
+                scopes=authorization_code.scopes,
+                expires_at=None,
+                subject=authorization_code.subject,
+            )
+            self._access_to_refresh[access] = refresh
+            self._refresh_to_access[refresh] = access
+            self._save_state()
 
         return OAuthToken(
             access_token=access,
@@ -248,9 +347,14 @@ class ClaudeOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
     async def load_access_token(self, token: str) -> AccessToken | None:
         access = self.access_tokens.get(token)
         if not access:
+            # Cold start / other instance: reload from disk once.
+            self._load_state()
+            access = self.access_tokens.get(token)
+        if not access:
             return None
         if access.expires_at and access.expires_at < time.time():
             self.access_tokens.pop(token, None)
+            self._save_state()
             return None
         return access
 
@@ -258,6 +362,9 @@ class ClaudeOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         self, client: OAuthClientInformationFull, refresh_token: str
     ) -> RefreshToken | None:
         token = self.refresh_tokens.get(refresh_token)
+        if not token:
+            self._load_state()
+            token = self.refresh_tokens.get(refresh_token)
         if not token or token.client_id != client.client_id:
             return None
         return token
@@ -268,6 +375,8 @@ class ClaudeOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         refresh_token: RefreshToken,
         scopes: list[str],
     ) -> OAuthToken:
+        if refresh_token.token not in self.refresh_tokens:
+            self._load_state()
         if refresh_token.token not in self.refresh_tokens:
             raise TokenError(error="invalid_grant", error_description="Unknown refresh token")
         if not client.client_id:
@@ -283,25 +392,27 @@ class ClaudeOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         new_refresh = f"mrt_{secrets.token_hex(32)}"
         expires_at = int(time.time()) + self.access_token_expiry_seconds
 
-        self.refresh_tokens.pop(refresh_token.token, None)
-        self._refresh_to_access.pop(refresh_token.token, None)
+        with self._lock:
+            self.refresh_tokens.pop(refresh_token.token, None)
+            self._refresh_to_access.pop(refresh_token.token, None)
 
-        self.access_tokens[access] = AccessToken(
-            token=access,
-            client_id=client.client_id,
-            scopes=granted,
-            expires_at=expires_at,
-            subject=refresh_token.subject,
-        )
-        self.refresh_tokens[new_refresh] = RefreshToken(
-            token=new_refresh,
-            client_id=client.client_id,
-            scopes=granted,
-            expires_at=None,
-            subject=refresh_token.subject,
-        )
-        self._access_to_refresh[access] = new_refresh
-        self._refresh_to_access[new_refresh] = access
+            self.access_tokens[access] = AccessToken(
+                token=access,
+                client_id=client.client_id,
+                scopes=granted,
+                expires_at=expires_at,
+                subject=refresh_token.subject,
+            )
+            self.refresh_tokens[new_refresh] = RefreshToken(
+                token=new_refresh,
+                client_id=client.client_id,
+                scopes=granted,
+                expires_at=None,
+                subject=refresh_token.subject,
+            )
+            self._access_to_refresh[access] = new_refresh
+            self._refresh_to_access[new_refresh] = access
+            self._save_state()
 
         return OAuthToken(
             access_token=access,
@@ -312,15 +423,17 @@ class ClaudeOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         )
 
     async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
-        if isinstance(token, AccessToken):
-            refresh = self._access_to_refresh.pop(token.token, None)
-            self.access_tokens.pop(token.token, None)
-            if refresh:
-                self.refresh_tokens.pop(refresh, None)
-                self._refresh_to_access.pop(refresh, None)
-        else:
-            access = self._refresh_to_access.pop(token.token, None)
-            self.refresh_tokens.pop(token.token, None)
-            if access:
-                self.access_tokens.pop(access, None)
-                self._access_to_refresh.pop(access, None)
+        with self._lock:
+            if isinstance(token, AccessToken):
+                refresh = self._access_to_refresh.pop(token.token, None)
+                self.access_tokens.pop(token.token, None)
+                if refresh:
+                    self.refresh_tokens.pop(refresh, None)
+                    self._refresh_to_access.pop(refresh, None)
+            else:
+                access = self._refresh_to_access.pop(token.token, None)
+                self.refresh_tokens.pop(token.token, None)
+                if access:
+                    self.access_tokens.pop(access, None)
+                    self._access_to_refresh.pop(access, None)
+            self._save_state()

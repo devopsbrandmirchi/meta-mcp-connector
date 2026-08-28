@@ -102,7 +102,8 @@ Reload MCP in Cursor settings after starting the server.
 | `get_integration_status` | Token / app health check |
 | `get_ads_summary` | KPI totals for a date range |
 | `get_daily_trend` | Day-by-day spend & metrics |
-| `get_performance_breakdown` | Breakdown by campaign / ad set / placement |
+| `get_performance_breakdown` | Breakdown by campaign / ad set / placement / **region·state** / country / DMA |
+| `get_conversions_by_region` | **Purchases & spend by state/region** (Meta `breakdowns=region`) |
 | `get_top_ads` | Top ads by spend or other metric |
 
 ## Example prompts
@@ -177,6 +178,12 @@ Claude.ai **requires OAuth** for remote custom connectors. This server embeds a 
 4. Paste **exactly**: `https://YOUR-CLOUD-RUN-URL/mcp` (must include `/mcp`)
 5. Leave **OAuth Client ID** empty in Advanced settings (DCR is enabled)
 6. Click Connect — Claude registers itself and authorizes briefly
+
+After a successful Connect, Claude should **stay connected** when you reopen the app.
+The connector persists OAuth refresh tokens on disk (`MCP_OAUTH_STATE_PATH`, default
+`/tmp/meta-mcp-oauth-state.json` on Cloud Run) and Cloud Run is set to `--min-instances 1`
+so the warm instance keeps that state. You only need to reconnect after a full redeploy
+or if you remove the connector.
 
 If you see *"Couldn't register with … sign-in service"* (`ofid_…`):
 

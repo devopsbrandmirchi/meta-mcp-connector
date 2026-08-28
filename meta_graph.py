@@ -110,6 +110,10 @@ def normalize_insight_row(row: dict[str, Any]) -> dict[str, Any]:
         "platform_position": row.get("platform_position") or "",
         "placement": row.get("platform_position") or row.get("publisher_platform") or "",
         "platform": row.get("publisher_platform") or "",
+        # Geographic breakdowns (Meta Insights API: region ≈ state/province)
+        "region": row.get("region") or "",
+        "country": row.get("country") or "",
+        "dma": row.get("dma") or "",
         "amount_spent_usd": float(row.get("spend") or 0),
         "impressions": int(float(row.get("impressions") or 0)),
         "reach": int(float(row.get("reach") or 0)),

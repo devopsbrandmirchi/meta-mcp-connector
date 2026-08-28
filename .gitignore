@@ -28,3 +28,7 @@ _test_*.py
 _fetch_*.py
 _yesterday_*.py
 _account_*.py
+
+# OAuth session persistence (Claude connector tokens)
+.meta-oauth-state.json
+.meta-oauth-state.json.tmp

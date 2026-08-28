@@ -436,6 +436,8 @@ PERFORMANCE (live from Facebook Graph API)
 - "Meta ads summary from 2026-08-01 to 2026-08-15"
 - "Daily spend and impressions last 7 days"
 - "Break down spend by campaign / ad set / ad / platform / placement"
+- "Break down by region / state / country / DMA"
+- "Conversions by state for last 7 days"
 - "Top ads by spend this month"
 
 Data is fetched live — not from a database cache.
@@ -696,22 +698,31 @@ def get_performance_breakdown(
     account_id: str = "",
     limit: int = 25,
 ) -> str:
-    """Break down Meta ads performance by campaign, adset, ad, platform, or placement."""
+    """Break down Meta ads by campaign, adset, ad, platform, placement, region/state, country, or DMA."""
     # level sets row granularity; breakdowns sets dimensional splits (D-2).
+    # Meta Insights "region" is state/province (e.g. California, Maharashtra).
     dim_map = {
         "campaign": ("campaign", "campaign_name", None),
         "adset": ("adset", "adset_name", None),
         "ad": ("ad", "ad_name", None),
         "platform": ("ad", "publisher_platform", "publisher_platform"),
         "placement": ("ad", "placement", "publisher_platform,platform_position"),
+        "region": ("campaign", "region", "region"),
+        "state": ("campaign", "region", "region"),
+        "country": ("campaign", "country", "country"),
+        "dma": ("campaign", "dma", "dma"),
     }
     key = (by or "campaign").strip().lower()
     spec = dim_map.get(key)
     if not spec:
-        return "Unknown breakdown. Use by=campaign|adset|ad|platform|placement."
+        return (
+            "Unknown breakdown. Use by=campaign|adset|ad|platform|placement|"
+            "region|state|country|dma."
+        )
 
     start, end = _date_range(start_date, end_date)
     level, col, breakdowns = spec
+    label = "state/region" if key in ("region", "state") else key
 
     rows = _fetch_insights(
         level=level,
@@ -733,7 +744,7 @@ def get_performance_breakdown(
             )
 
     if not rows:
-        return f"No data for breakdown by {key} in that range."
+        return f"No data for breakdown by {label} in that range."
 
     buckets = _aggregate_metrics(rows, group_by=col)
     ranked = sorted(
@@ -753,10 +764,105 @@ def get_performance_breakdown(
         for name, v in ranked
     ]
     return (
-        f"Performance by {key} (Graph API)\n"
+        f"Performance by {label} (Graph API)\n"
         f"{start.isoformat()} to {end.isoformat()}\n"
         + _table_lines(
-            [key.title(), "Spend", "Impressions", "Clicks", "Purchases"], table
+            [label.title(), "Spend", "Impressions", "Clicks", "Purchases"], table
+        )
+    )
+
+
+@mcp.tool()
+def get_conversions_by_region(
+    start_date: str,
+    end_date: str = "",
+    campaign: str = "",
+    account_id: str = "",
+    geo: str = "region",
+    limit: int = 50,
+) -> str:
+    """
+    Conversions (purchases) and spend broken down by geographic region/state.
+
+    Meta Insights uses breakdowns=region for state/province (e.g. California,
+    Texas, Maharashtra). Use geo=country or geo=dma for country or US DMA.
+    """
+    geo_key = (geo or "region").strip().lower()
+    if geo_key in ("state", "states", "province", "provinces"):
+        geo_key = "region"
+    if geo_key not in ("region", "country", "dma"):
+        return "Unknown geo. Use geo=region|state|country|dma."
+
+    start, end = _date_range(start_date, end_date)
+    rows = _fetch_insights(
+        level="campaign",
+        start=start,
+        end=end,
+        account_id=account_id,
+        breakdowns=geo_key,
+        campaign=campaign,
+        time_increment="all_days",
+    )
+    if campaign.strip() and not _fb().resolve_campaign_id(account_id, campaign):
+        rows = _filter_rows(rows, campaign=campaign)
+
+    if not rows:
+        return (
+            f"No geographic conversion data ({geo_key}) in that range. "
+            "Confirm the account has delivery and purchase events."
+        )
+
+    buckets: dict[str, dict[str, float]] = defaultdict(
+        lambda: {
+            "amount_spent_usd": 0.0,
+            "impressions": 0.0,
+            "clicks_all": 0.0,
+            "purchases": 0.0,
+            "purchases_value": 0.0,
+        }
+    )
+    for r in rows:
+        name = str(r.get(geo_key) or "").strip() or "(unknown)"
+        buckets[name]["amount_spent_usd"] += float(r.get("amount_spent_usd") or 0)
+        buckets[name]["impressions"] += float(r.get("impressions") or 0)
+        buckets[name]["clicks_all"] += float(r.get("clicks_all") or 0)
+        buckets[name]["purchases"] += float(r.get("purchases") or 0)
+        buckets[name]["purchases_value"] += float(r.get("purchases_value") or 0)
+
+    ranked = sorted(
+        buckets.items(),
+        key=lambda kv: (kv[1]["purchases"], kv[1]["amount_spent_usd"]),
+        reverse=True,
+    )[: max(1, min(limit, 200))]
+
+    label = "State/Region" if geo_key == "region" else geo_key.upper()
+    table = []
+    for name, v in ranked:
+        spend = float(v["amount_spent_usd"])
+        purchases = int(v["purchases"])
+        cpa = (spend / purchases) if purchases else 0.0
+        table.append(
+            [
+                name,
+                _fmt_int(purchases),
+                _fmt_usd(v["purchases_value"]),
+                _fmt_usd(spend),
+                _fmt_usd(cpa) if purchases else "—",
+                _fmt_int(v["impressions"]),
+                _fmt_int(v["clicks_all"]),
+            ]
+        )
+
+    total_purchases = int(sum(v["purchases"] for _, v in buckets.items()))
+    total_spend = sum(v["amount_spent_usd"] for _, v in buckets.items())
+    return (
+        f"Conversions by {label.lower()} (Graph API breakdowns={geo_key})\n"
+        f"{start.isoformat()} to {end.isoformat()}\n"
+        f"Totals: {total_purchases:,} purchases · {_fmt_usd(total_spend)} spend · "
+        f"{len(buckets)} {label.lower()}(s)\n"
+        + _table_lines(
+            [label, "Purchases", "Purchase value", "Spend", "CPA", "Impressions", "Clicks"],
+            table,
         )
     )
 
@@ -1082,6 +1188,7 @@ if __name__ == "__main__":
         "get_ads_summary",
         "get_daily_trend",
         "get_performance_breakdown",
+        "get_conversions_by_region",
         "get_top_ads",
     ]
     print("Tools: " + ", ".join(tools), file=sys.stderr, flush=True)
