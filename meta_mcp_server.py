@@ -109,7 +109,9 @@ def _patch_claude_oauth_compat(scope: str = "meta") -> None:
 
     1. Advertise token_endpoint_auth_methods_supported including \"none\".
     2. Treat DCR clients as public (PKCE) even when they request client_secret_post.
-    3. Expose scopes_supported in authorization-server metadata.
+    3. Expose scopes_supported and CIMD support in authorization-server metadata.
+    4. Strip unsupported jwt-bearer grant from Claude CIMD registration payloads.
+    5. Preserve HTTPS client_id values during DCR (Claude CIMD).
     """
     import json
 
@@ -129,9 +131,52 @@ def _patch_claude_oauth_compat(scope: str = "meta") -> None:
         metadata.token_endpoint_auth_methods_supported = methods
         if not metadata.scopes_supported:
             metadata.scopes_supported = [scope]
+        metadata.client_id_metadata_document_supported = True
+        # Claude canonical URLs omit trailing slashes on the issuer host.
+        from pydantic import AnyHttpUrl
+
+        metadata.issuer = AnyHttpUrl(str(metadata.issuer).rstrip("/"))
         return metadata
 
     auth_routes.build_metadata = build_metadata
+
+    original_create_pr = auth_routes.create_protected_resource_routes
+
+    def create_protected_resource_routes(
+        resource_url, authorization_servers, scopes_supported=None, **kwargs
+    ):
+        from pydantic import AnyHttpUrl
+
+        normalized = [
+            AnyHttpUrl(str(url).rstrip("/")) for url in authorization_servers
+        ]
+        return original_create_pr(
+            resource_url,
+            normalized,
+            scopes_supported=scopes_supported,
+            **kwargs,
+        )
+
+    auth_routes.create_protected_resource_routes = create_protected_resource_routes
+
+    register_mod._meta_cimd_client_id = None
+    original_uuid4 = register_mod.uuid4
+
+    class _CimdClientId:
+        def __init__(self, value: str) -> None:
+            self._value = value
+
+        def __str__(self) -> str:
+            return self._value
+
+    def uuid4_with_cimd():
+        cimd = register_mod._meta_cimd_client_id
+        if cimd:
+            register_mod._meta_cimd_client_id = None
+            return _CimdClientId(cimd)
+        return original_uuid4()
+
+    register_mod.uuid4 = uuid4_with_cimd
 
     original_handle = register_mod.RegistrationHandler.handle
 
@@ -145,6 +190,16 @@ def _patch_claude_oauth_compat(scope: str = "meta") -> None:
                 "client_secret_basic",
             ):
                 data["token_endpoint_auth_method"] = "none"
+            grants = data.get("grant_types")
+            if isinstance(grants, list):
+                data["grant_types"] = [
+                    g
+                    for g in grants
+                    if g != "urn:ietf:params:oauth:grant-type:jwt-bearer"
+                ]
+            client_id = data.get("client_id")
+            if isinstance(client_id, str) and client_id.startswith("https://"):
+                register_mod._meta_cimd_client_id = client_id
             from starlette.requests import Request as StarletteRequest
 
             patched = json.dumps(data).encode()
@@ -154,7 +209,7 @@ def _patch_claude_oauth_compat(scope: str = "meta") -> None:
 
             request = StarletteRequest(request.scope, receive)
         except Exception:
-            pass
+            register_mod._meta_cimd_client_id = None
         return await original_handle(self, request)
 
     register_mod.RegistrationHandler.handle = handle
@@ -783,6 +838,37 @@ def _cors_headers() -> dict[str, str]:
         "Access-Control-Allow-Methods": "GET, OPTIONS",
         "Access-Control-Allow-Headers": "Content-Type",
     }
+
+
+@mcp.custom_route("/.well-known/openid-configuration", methods=["GET", "OPTIONS"])
+async def openid_configuration(request):
+    """Claude falls back to OIDC discovery when RFC 8414 metadata is unavailable."""
+    from starlette.responses import JSONResponse, Response
+
+    if request.method == "OPTIONS":
+        return Response(status_code=204, headers=_cors_headers())
+    if not MCP_PUBLIC_URL:
+        return JSONResponse({"error": "oauth_disabled"}, status_code=404)
+
+    from pydantic import AnyHttpUrl
+
+    from mcp.server.auth.routes import build_metadata
+    from mcp.server.auth.settings import ClientRegistrationOptions, RevocationOptions
+
+    metadata = build_metadata(
+        AnyHttpUrl(MCP_PUBLIC_URL.rstrip("/") + "/"),
+        None,
+        ClientRegistrationOptions(
+            enabled=True,
+            valid_scopes=None,
+            default_scopes=["meta"],
+        ),
+        RevocationOptions(),
+    )
+    return JSONResponse(
+        metadata.model_dump(mode="json", exclude_none=True),
+        headers={"Cache-Control": "public, max-age=3600", **_cors_headers()},
+    )
 
 
 @mcp.custom_route("/health", methods=["GET"])

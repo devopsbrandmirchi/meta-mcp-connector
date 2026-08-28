@@ -15,8 +15,10 @@ from __future__ import annotations
 import logging
 import secrets
 import time
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlparse
+
+import httpx
 
 from mcp.server.auth.provider import (
     AccessToken,
@@ -36,6 +38,14 @@ logger = logging.getLogger("meta-oauth")
 DEFAULT_SCOPE = "meta"
 DEFAULT_ACCESS_TOKEN_EXPIRY = 30 * 24 * 60 * 60  # 30 days
 DEFAULT_ALLOWED_REDIRECT_DOMAINS = ("claude.ai", "claude.com", "localhost", "127.0.0.1")
+
+# Claude.ai publishes client metadata at these URLs (CIMD) instead of always using DCR.
+CLAUDE_CIMD_URLS = (
+    "https://claude.ai/oauth/mcp-oauth-client-metadata",
+    "https://claude.com/oauth/mcp-oauth-client-metadata",
+)
+
+JWT_BEARER_GRANT = "urn:ietf:params:oauth:grant-type:jwt-bearer"
 
 
 class ClaudeOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshToken, AccessToken]):
@@ -81,7 +91,58 @@ class ClaudeOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         return False
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
-        return self.clients.get(client_id)
+        existing = self.clients.get(client_id)
+        if existing:
+            return existing
+        return await self._ensure_cimd_client(client_id)
+
+    async def _ensure_cimd_client(self, client_id: str) -> OAuthClientInformationFull | None:
+        """Accept Claude CIMD client_ids without a prior /register call."""
+        if not client_id.startswith("https://"):
+            return None
+
+        host = (urlparse(client_id).hostname or "").lower()
+        if not any(host == d or host.endswith(f".{d}") for d in self.allowed_redirect_domains):
+            return None
+
+        if client_id not in CLAUDE_CIMD_URLS and "/oauth/" not in client_id:
+            return None
+
+        try:
+            res = httpx.get(client_id, timeout=10.0, follow_redirects=True)
+            if not res.is_success:
+                logger.warning("CIMD fetch failed for %s: %s", client_id, res.status_code)
+                return None
+            raw: dict[str, Any] = res.json()
+        except Exception as exc:
+            logger.warning("CIMD fetch error for %s: %s", client_id, exc)
+            return None
+
+        redirect_uris = [u for u in (raw.get("redirect_uris") or []) if self._is_redirect_allowed(u)]
+        if not redirect_uris:
+            logger.warning("CIMD %s had no allowed redirect URIs", client_id)
+            return None
+
+        grant_types = [
+            g
+            for g in (raw.get("grant_types") or ["authorization_code", "refresh_token"])
+            if g != JWT_BEARER_GRANT
+        ]
+        if "authorization_code" not in grant_types:
+            grant_types.insert(0, "authorization_code")
+
+        client_info = OAuthClientInformationFull(
+            client_id=client_id,
+            client_name=raw.get("client_name") or "Claude",
+            redirect_uris=redirect_uris,
+            grant_types=grant_types,
+            response_types=raw.get("response_types") or ["code"],
+            token_endpoint_auth_method="none",
+            scope=self.scope,
+        )
+        self.clients[client_id] = client_info
+        logger.info("Registered CIMD OAuth client %s", client_id)
+        return client_info
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         if not client_info.client_id:
