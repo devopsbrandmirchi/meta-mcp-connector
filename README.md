@@ -34,7 +34,7 @@ meta-mcp-connector/
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/meta-mcp-connector.git
+git clone https://github.com/devopsbrandmirchi/meta-mcp-connector.git
 cd meta-mcp-connector
 python -m venv .venv
 
@@ -253,16 +253,25 @@ If you see *"This connector has a server configuration issue"*:
 
 ## Push to GitHub
 
+Repo: https://github.com/devopsbrandmirchi/meta-mcp-connector
+
 ```powershell
-# Sign in to your new GitHub account first
+# Sign in to the devopsbrandmirchi GitHub account if needed
 git credential-manager github login --force
 
-# Create repo on GitHub (browser or gh), then:
-git remote add origin https://github.com/YOUR_USERNAME/meta-mcp-connector.git
-git add .
-git commit -m "Initial commit: Meta MCP connector"
+# Point origin at the org repo (replaces any old personal remote)
+git remote remove origin 2>$null
+git remote add origin https://github.com/devopsbrandmirchi/meta-mcp-connector.git
 git push -u origin main
 ```
+
+For a **new Cloud Run** service (fresh URL, no old `meta-mcp-connector-git` fallback):
+
+```powershell
+.\deploy-cloudrun.ps1 -ProjectId "YOUR_GCP_PROJECT_ID" -Region "us-central1" -Service "meta-mcp"
+```
+
+Then in Claude use exactly: `https://YOUR-NEW-SERVICE-URL/mcp`
 
 ## Security
 

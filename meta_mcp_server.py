@@ -92,9 +92,6 @@ def _resolve_public_url() -> str:
 
     if service and region and project_number:
         return f"https://{service}-{project_number}.{region}.run.app"
-    # Known Git → Cloud Run service until MCP_PUBLIC_URL is set explicitly.
-    if service == "meta-mcp-connector-git":
-        return "https://meta-mcp-connector-git-573223329822.us-central1.run.app"
     return ""
 
 
