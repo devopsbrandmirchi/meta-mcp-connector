@@ -197,10 +197,12 @@ Claude.ai **requires OAuth** for remote custom connectors. This server embeds a 
 6. Click Connect — Claude registers itself and authorizes briefly
 
 After a successful Connect, Claude should **stay connected** when you reopen the app.
-The connector persists OAuth refresh tokens on disk (`MCP_OAUTH_STATE_PATH`, default
-`/tmp/meta-mcp-oauth-state.json` on Cloud Run) and Cloud Run is set to `--min-instances 1`
-so the warm instance keeps that state. You only need to reconnect after a full redeploy
-or if you remove the connector.
+OAuth refresh tokens are stored in **GCS** (`MCP_OAUTH_GCS_BUCKET`, created by
+`deploy-cloudrun.ps1`) so sessions survive Cloud Run deploys. Refresh tokens are
+**not rotated** (avoids Claude session-timeout races). Local fallback is
+`/tmp/meta-mcp-oauth-state.json` with `--min-instances 1`.
+
+You only need to reconnect if you remove the connector or wipe the GCS OAuth bucket.
 
 If you see *"Couldn't register with … sign-in service"* (`ofid_…`):
 

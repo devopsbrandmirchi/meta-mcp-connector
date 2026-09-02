@@ -44,7 +44,8 @@ from pydantic import AnyUrl
 logger = logging.getLogger("meta-oauth")
 
 DEFAULT_SCOPE = "meta"
-DEFAULT_ACCESS_TOKEN_EXPIRY = 30 * 24 * 60 * 60  # 30 days
+# Long-lived access tokens — Claude refresh races less often.
+DEFAULT_ACCESS_TOKEN_EXPIRY = 90 * 24 * 60 * 60  # 90 days
 DEFAULT_ALLOWED_REDIRECT_DOMAINS = ("claude.ai", "claude.com", "localhost", "127.0.0.1")
 
 # Claude.ai publishes client metadata at these URLs (CIMD) instead of always using DCR.
@@ -63,6 +64,54 @@ def _default_state_path() -> str:
     if os.environ.get("K_SERVICE"):
         return "/tmp/meta-mcp-oauth-state.json"
     return str(Path(__file__).resolve().parent / ".meta-oauth-state.json")
+
+
+def _gcs_bucket_and_blob() -> tuple[str, str] | tuple[None, None]:
+    """
+    Durable OAuth state across Cloud Run deploys/instance replaces.
+
+    Set MCP_OAUTH_GCS_BUCKET (bucket name) or MCP_OAUTH_GCS_URI=gs://bucket/object.json
+    /tmp alone is wiped on every new Cloud Run revision — that causes Claude
+    "session timeout" while DV360/Reddit stay up if their instances keep memory.
+    """
+    uri = os.environ.get("MCP_OAUTH_GCS_URI", "").strip()
+    if uri.startswith("gs://"):
+        rest = uri[5:]
+        bucket, _, blob = rest.partition("/")
+        return bucket, (blob or "meta-mcp-oauth-state.json")
+    bucket = os.environ.get("MCP_OAUTH_GCS_BUCKET", "").strip()
+    if bucket:
+        return bucket, os.environ.get(
+            "MCP_OAUTH_GCS_OBJECT", "meta-mcp-oauth-state.json"
+        ).strip() or "meta-mcp-oauth-state.json"
+    return None, None
+
+
+def _gcs_read(bucket: str, blob: str) -> Optional[str]:
+    try:
+        from google.cloud import storage  # type: ignore
+
+        client = storage.Client()
+        obj = client.bucket(bucket).blob(blob)
+        if not obj.exists():
+            return None
+        return obj.download_as_text(encoding="utf-8")
+    except Exception as exc:
+        logger.warning("GCS OAuth state read failed gs://%s/%s: %s", bucket, blob, exc)
+        return None
+
+
+def _gcs_write(bucket: str, blob: str, text: str) -> bool:
+    try:
+        from google.cloud import storage  # type: ignore
+
+        client = storage.Client()
+        obj = client.bucket(bucket).blob(blob)
+        obj.upload_from_string(text, content_type="application/json")
+        return True
+    except Exception as exc:
+        logger.warning("GCS OAuth state write failed gs://%s/%s: %s", bucket, blob, exc)
+        return False
 
 
 class ClaudeOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshToken, AccessToken]):
@@ -88,6 +137,7 @@ class ClaudeOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         self.access_token_expiry_seconds = access_token_expiry_seconds
         self.scope = scope
         self.state_path = state_path or _default_state_path()
+        self._gcs_bucket, self._gcs_blob = _gcs_bucket_and_blob()
         self._lock = threading.Lock()
 
         self.clients: dict[str, OAuthClientInformationFull] = {}
@@ -98,6 +148,18 @@ class ClaudeOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         self._refresh_to_access: dict[str, str] = {}
 
         self._load_state()
+        if self._gcs_bucket:
+            logger.info(
+                "OAuth durable store: gs://%s/%s (survives Cloud Run deploys)",
+                self._gcs_bucket,
+                self._gcs_blob,
+            )
+        else:
+            logger.warning(
+                "OAuth state is local-only (%s). On Cloud Run set "
+                "MCP_OAUTH_GCS_BUCKET so Claude sessions survive deploys.",
+                self.state_path,
+            )
 
     def _is_redirect_allowed(self, redirect_uri: str) -> bool:
         try:
@@ -112,16 +174,7 @@ class ClaudeOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
                 return True
         return False
 
-    def _load_state(self) -> None:
-        path = Path(self.state_path)
-        if not path.is_file():
-            return
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            logger.warning("Could not load OAuth state from %s: %s", path, exc)
-            return
-
+    def _apply_state_payload(self, raw: dict[str, Any], *, source: str) -> None:
         now = time.time()
         for client in raw.get("clients") or []:
             try:
@@ -149,41 +202,79 @@ class ClaudeOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
             except Exception:
                 pass
 
+        # Always restore refresh→access links even if access token expired
+        # (Claude still refreshes with the refresh token alone).
         for access, refresh in (raw.get("access_to_refresh") or {}).items():
-            if access in self.access_tokens and refresh in self.refresh_tokens:
+            if refresh in self.refresh_tokens:
                 self._access_to_refresh[access] = refresh
                 self._refresh_to_access[refresh] = access
+        for refresh, access in (raw.get("refresh_to_access") or {}).items():
+            if refresh in self.refresh_tokens:
+                self._refresh_to_access[refresh] = access
+                if access:
+                    self._access_to_refresh[access] = refresh
 
         logger.info(
             "Loaded OAuth state from %s (%d clients, %d access, %d refresh)",
-            path,
+            source,
             len(self.clients),
             len(self.access_tokens),
             len(self.refresh_tokens),
         )
 
+    def _load_state(self) -> None:
+        # Prefer durable GCS, then local file (warm instance).
+        if self._gcs_bucket and self._gcs_blob:
+            text = _gcs_read(self._gcs_bucket, self._gcs_blob)
+            if text:
+                try:
+                    self._apply_state_payload(json.loads(text), source=f"gs://{self._gcs_bucket}/{self._gcs_blob}")
+                    return
+                except Exception as exc:
+                    logger.warning("Bad GCS OAuth JSON: %s", exc)
+
+        path = Path(self.state_path)
+        if not path.is_file():
+            return
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Could not load OAuth state from %s: %s", path, exc)
+            return
+        self._apply_state_payload(raw, source=str(path))
+
     def _save_state(self) -> None:
         path = Path(self.state_path)
+        payload = {
+            "saved_at": int(time.time()),
+            "clients": [c.model_dump(mode="json") for c in self.clients.values()],
+            "access_tokens": [
+                t.model_dump(mode="json") for t in self.access_tokens.values()
+            ],
+            "refresh_tokens": [
+                t.model_dump(mode="json") for t in self.refresh_tokens.values()
+            ],
+            "access_to_refresh": dict(self._access_to_refresh),
+            "refresh_to_access": dict(self._refresh_to_access),
+        }
+        text = json.dumps(payload)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            payload = {
-                "saved_at": int(time.time()),
-                "clients": [c.model_dump(mode="json") for c in self.clients.values()],
-                "access_tokens": [
-                    t.model_dump(mode="json") for t in self.access_tokens.values()
-                ],
-                "refresh_tokens": [
-                    t.model_dump(mode="json") for t in self.refresh_tokens.values()
-                ],
-                "access_to_refresh": dict(self._access_to_refresh),
-            }
             tmp = path.with_suffix(path.suffix + ".tmp")
-            tmp.write_text(json.dumps(payload), encoding="utf-8")
+            tmp.write_text(text, encoding="utf-8")
             tmp.replace(path)
         except Exception as exc:
             logger.warning("Could not persist OAuth state to %s: %s", path, exc)
 
+        if self._gcs_bucket and self._gcs_blob:
+            _gcs_write(self._gcs_bucket, self._gcs_blob, text)
+
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
+        existing = self.clients.get(client_id)
+        if existing:
+            return existing
+        # After Cloud Run restart, reload durable store before giving up.
+        self._load_state()
         existing = self.clients.get(client_id)
         if existing:
             return existing
@@ -389,13 +480,14 @@ class ClaudeOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
 
         granted = scopes or refresh_token.scopes
         access = f"mat_{secrets.token_hex(32)}"
-        new_refresh = f"mrt_{secrets.token_hex(32)}"
         expires_at = int(time.time()) + self.access_token_expiry_seconds
 
+        # IMPORTANT: do NOT rotate the refresh token.
+        # Rotating causes Claude "session timeout" when:
+        # 1) Cloud Run /tmp state is wiped mid-refresh, or
+        # 2) Claude still holds the previous refresh token after a race.
+        # DV360/Reddit stay up when refresh tokens remain stable + durable.
         with self._lock:
-            self.refresh_tokens.pop(refresh_token.token, None)
-            self._refresh_to_access.pop(refresh_token.token, None)
-
             self.access_tokens[access] = AccessToken(
                 token=access,
                 client_id=client.client_id,
@@ -403,22 +495,23 @@ class ClaudeOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
                 expires_at=expires_at,
                 subject=refresh_token.subject,
             )
-            self.refresh_tokens[new_refresh] = RefreshToken(
-                token=new_refresh,
+            # Keep the same refresh token entry
+            self.refresh_tokens[refresh_token.token] = RefreshToken(
+                token=refresh_token.token,
                 client_id=client.client_id,
                 scopes=granted,
                 expires_at=None,
                 subject=refresh_token.subject,
             )
-            self._access_to_refresh[access] = new_refresh
-            self._refresh_to_access[new_refresh] = access
+            self._access_to_refresh[access] = refresh_token.token
+            self._refresh_to_access[refresh_token.token] = access
             self._save_state()
 
         return OAuthToken(
             access_token=access,
             token_type="Bearer",
             expires_in=self.access_token_expiry_seconds,
-            refresh_token=new_refresh,
+            refresh_token=refresh_token.token,
             scope=" ".join(granted),
         )
 

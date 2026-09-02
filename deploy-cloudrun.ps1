@@ -122,13 +122,30 @@ if ($useAccessTokenSecret) {
 }
 
 Write-Host "Building and deploying from source (Dockerfile)..."
+
+# Durable Claude OAuth sessions (survives Cloud Run deploys — /tmp alone causes session timeouts)
+$oauthBucket = "meta-mcp-oauth-state-$ProjectId"
+$bucketExists = $null
+try { $bucketExists = gcloud storage buckets describe "gs://$oauthBucket" --project $ProjectId 2>$null } catch { $bucketExists = $null }
+if (-not $bucketExists) {
+    Write-Host "Creating OAuth state bucket gs://$oauthBucket ..."
+    gcloud storage buckets create "gs://$oauthBucket" --project $ProjectId --location=$Region --uniform-bucket-level-access
+}
+
+# Allow the Cloud Run runtime SA to read/write OAuth state
+$runtimeSa = "$projectNumber-compute@developer.gserviceaccount.com"
+gcloud storage buckets add-iam-policy-binding "gs://$oauthBucket" `
+    --member="serviceAccount:$runtimeSa" `
+    --role="roles/storage.objectAdmin" `
+    --project $ProjectId 2>$null
+
 gcloud run deploy $Service `
     --project $ProjectId `
     --region $Region `
     --source . `
     --command python `
     --args "meta_mcp_server.py" `
-    --set-env-vars "MCP_TRANSPORT=http,HOST=0.0.0.0,FACEBOOK_APP_ID=$appId,FACEBOOK_AD_ACCOUNT_ID=$adAccount,CLOUD_RUN_REGION=$Region,CLOUD_RUN_PROJECT_NUMBER=$projectNumber" `
+    --set-env-vars "MCP_TRANSPORT=http,HOST=0.0.0.0,FACEBOOK_APP_ID=$appId,FACEBOOK_AD_ACCOUNT_ID=$adAccount,CLOUD_RUN_REGION=$Region,CLOUD_RUN_PROJECT_NUMBER=$projectNumber,MCP_OAUTH_GCS_BUCKET=$oauthBucket" `
     --set-secrets $secretsArg `
     --allow-unauthenticated `
     --session-affinity `
@@ -146,7 +163,7 @@ Write-Host "Setting MCP_PUBLIC_URL=$url for Claude OAuth discovery..."
 gcloud run services update $Service `
     --project $ProjectId `
     --region $Region `
-    --update-env-vars "MCP_PUBLIC_URL=$url"
+    --update-env-vars "MCP_PUBLIC_URL=$url,MCP_OAUTH_GCS_BUCKET=$oauthBucket"
 
 Write-Host ""
 Write-Host "Deployed. MCP connector URL (use this exact path):"
