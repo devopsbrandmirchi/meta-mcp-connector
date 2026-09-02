@@ -1,0 +1,15 @@
+---
+description: Sibling project tiktok-mcp-connector mirrors this connector's Cloud Run / Claude workflow
+alwaysApply: true
+---
+
+# Sibling: tiktok-mcp-connector
+
+A clone lives at `c:\htmls\tiktok-mcp-connector` with the same Cloud Run + Claude OAuth + MCP tool pattern.
+
+When the user works on TikTok MCP (or says "same steps as Meta"):
+
+1. Mirror this project's deploy/OAuth/tool patterns
+2. Use `TIKTOK_*` env vars and `tiktok_mcp_server.py`
+3. Do not mix Meta Graph credentials into the TikTok project
+4. User pushes TikTok to a **different** GitHub remote later — do not push TikTok to the Meta repo
