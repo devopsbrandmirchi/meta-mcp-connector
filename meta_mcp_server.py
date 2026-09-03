@@ -1407,11 +1407,17 @@ async def health_check(request):
     from starlette.responses import JSONResponse
 
     oauth_ready = bool(MCP_PUBLIC_URL)
+    has_jwt_secret = bool(
+        os.environ.get("MCP_OAUTH_JWT_SECRET", "").strip()
+        or os.environ.get("FACEBOOK_APP_SECRET", "").strip()
+    )
     return JSONResponse(
         {
             "status": "ok",
             "service": "meta",
             "oauth_enabled": oauth_ready,
+            "oauth_token_mode": "signed_stateless",
+            "oauth_sessions_survive_deploys": has_jwt_secret,
             "public_url": MCP_PUBLIC_URL or None,
             "mcp_url": MCP_RESOURCE_URL or None,
             "oauth_discovery": (

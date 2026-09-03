@@ -197,12 +197,12 @@ Claude.ai **requires OAuth** for remote custom connectors. This server embeds a 
 6. Click Connect — Claude registers itself and authorizes briefly
 
 After a successful Connect, Claude should **stay connected** when you reopen the app.
-OAuth refresh tokens are stored in **GCS** (`MCP_OAUTH_GCS_BUCKET`, created by
-`deploy-cloudrun.ps1`) so sessions survive Cloud Run deploys. Refresh tokens are
-**not rotated** (avoids Claude session-timeout races). Local fallback is
-`/tmp/meta-mcp-oauth-state.json` with `--min-instances 1`.
+OAuth access/refresh tokens are **HMAC-signed and stateless** (no /tmp session store).
+They survive Cloud Run deploys and cold starts — this is what stopped the daily
+"Your session has expired" loop. Signing uses `MCP_OAUTH_JWT_SECRET` or falls back
+to `FACEBOOK_APP_SECRET` (already on Cloud Run via Secret Manager).
 
-You only need to reconnect if you remove the connector or wipe the GCS OAuth bucket.
+You only need to reconnect once after this update is live, or if you remove the connector.
 
 If you see *"Couldn't register with … sign-in service"* (`ofid_…`):
 
