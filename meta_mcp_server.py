@@ -303,6 +303,30 @@ def _fmt_usd(n: Any) -> str:
     return f"${_fmt_float(n)}"
 
 
+# Purchases come from omni_purchase under this Insights attribution window.
+PURCHASE_ATTRIBUTION = "Purchases: omni, 7-day click + 1-day view."
+
+
+def _fmt_roas(purchase_value: float, spend: float) -> str:
+    if not spend:
+        return "—"
+    return _fmt_float(purchase_value / spend)
+
+
+def _report_preamble(*lines: str, campaign_note: str = "") -> str:
+    parts = [ln for ln in lines if ln]
+    parts.append(PURCHASE_ATTRIBUTION)
+    if campaign_note:
+        parts.append(campaign_note)
+    return "\n".join(parts) + "\n"
+
+
+def _empty_report(message: str, campaign_note: str = "") -> str:
+    if campaign_note:
+        return f"{message}\n{campaign_note}"
+    return message
+
+
 def _sum_field(rows: list[dict], field: str, *, as_float: bool = False) -> float:
     total = 0.0
     for r in rows:
@@ -361,10 +385,11 @@ def _fetch_insights(
     breakdowns: Optional[str] = None,
     campaign: str = "",
     time_increment: Any = 1,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], str]:
+    """Return insight rows and a campaign-filter note (empty when unfiltered)."""
     client = _fb()
     if campaign.strip():
-        return client.fetch_insights_for_campaign(
+        rows, scope = client.fetch_insights_for_campaign(
             account_id,
             campaign,
             level=level,
@@ -373,13 +398,17 @@ def _fetch_insights(
             breakdowns=breakdowns,
             time_increment=time_increment,
         )
-    return client.fetch_insights(
-        account_id,
-        level=level,
-        since=start,
-        until=end,
-        breakdowns=breakdowns,
-        time_increment=time_increment,
+        return rows, scope.note()
+    return (
+        client.fetch_insights(
+            account_id,
+            level=level,
+            since=start,
+            until=end,
+            breakdowns=breakdowns,
+            time_increment=time_increment,
+        ),
+        "",
     )
 
 
@@ -591,9 +620,9 @@ def get_ads_summary(
 ) -> str:
     """Get Meta ads KPI totals for a date range (live Graph API insights)."""
     start, end = _date_range(start_date, end_date)
-    # Account-level aggregate for the window (time_increment=all_days). Campaign
-    # filter resolves to the campaign edge when possible (D-5).
-    rows = _fetch_insights(
+    # Account-level aggregate for the window (time_increment=all_days). A unique
+    # campaign uses that campaign edge; a substring uses every name match (D-5).
+    rows, campaign_note = _fetch_insights(
         level="account" if not campaign.strip() else "campaign",
         start=start,
         end=end,
@@ -604,7 +633,10 @@ def get_ads_summary(
     if campaign.strip():
         rows = _filter_rows(rows, campaign=campaign)
     if not rows:
-        return f"No ad data found for {start.isoformat()} to {end.isoformat()}."
+        return _empty_report(
+            f"No ad data found for {start.isoformat()} to {end.isoformat()}.",
+            campaign_note,
+        )
 
     spend = _sum_field(rows, "amount_spent_usd", as_float=True)
     impressions = _sum_field(rows, "impressions")
@@ -623,15 +655,16 @@ def get_ads_summary(
         lines.append(f"Account: {account_id.strip()}")
     elif _fb().default_account:
         lines.append(f"Account: act_{_fb().default_account}")
-    if campaign.strip():
-        lines.append(f"Filter: {campaign.strip()}")
+    if campaign_note:
+        lines.append(campaign_note)
     lines.extend([
         f"Spend: {_fmt_usd(spend)}",
         f"Impressions: {_fmt_int(impressions)}",
         f"Reach: {_fmt_int(reach)}",
         f"Clicks: {_fmt_int(clicks)}",
-        f"Purchases (omni): {_fmt_int(purchases)}",
+        f"Purchases (omni, 7-day click + 1-day view): {_fmt_int(purchases)}",
         f"Purchase value: {_fmt_usd(purchase_value)}",
+        f"ROAS: {_fmt_roas(purchase_value, spend)}",
     ])
     if clicks > 0:
         lines.append(f"CPC: {_fmt_usd(spend / clicks)}")
@@ -647,9 +680,9 @@ def get_daily_trend(
     campaign: str = "",
     account_id: str = "",
 ) -> str:
-    """Daily Meta ads spend, impressions, clicks, and purchases (Graph API)."""
+    """Daily Meta ads spend, impressions, clicks, purchases, and purchase value."""
     start, end = _date_range(start_date, end_date)
-    rows = _fetch_insights(
+    rows, campaign_note = _fetch_insights(
         level="account" if not campaign.strip() else "campaign",
         start=start,
         end=end,
@@ -661,7 +694,13 @@ def get_daily_trend(
         rows = _filter_rows(rows, campaign=campaign)
 
     daily: dict[str, dict[str, float]] = defaultdict(
-        lambda: {"spend": 0.0, "impressions": 0, "clicks": 0, "purchases": 0}
+        lambda: {
+            "spend": 0.0,
+            "impressions": 0,
+            "clicks": 0,
+            "purchases": 0,
+            "purchase_value": 0.0,
+        }
     )
     for r in rows:
         d = str(r.get("date_start") or r.get("day") or "")[:10]
@@ -671,10 +710,14 @@ def get_daily_trend(
         daily[d]["impressions"] += int(r.get("impressions") or 0)
         daily[d]["clicks"] += int(r.get("clicks_all") or 0)
         daily[d]["purchases"] += int(r.get("purchases") or 0)
+        daily[d]["purchase_value"] += float(r.get("purchases_value") or 0)
 
     if not daily:
         label = campaign.strip() or "account"
-        return f"No daily data for {label} in that range."
+        return _empty_report(
+            f"No daily data for {label} in that range.",
+            campaign_note,
+        )
 
     table = [
         [
@@ -683,13 +726,21 @@ def get_daily_trend(
             _fmt_int(v["impressions"]),
             _fmt_int(v["clicks"]),
             _fmt_int(v["purchases"]),
+            _fmt_usd(v["purchase_value"]),
+            _fmt_roas(v["purchase_value"], v["spend"]),
         ]
         for d, v in sorted(daily.items())
     ]
     return (
-        f"Daily trend (Graph API)\n"
-        f"{start.isoformat()} to {end.isoformat()}\n"
-        + _table_lines(["Date", "Spend", "Impressions", "Clicks", "Purchases"], table)
+        _report_preamble(
+            "Daily trend (Graph API)",
+            f"{start.isoformat()} to {end.isoformat()}",
+            campaign_note=campaign_note,
+        )
+        + _table_lines(
+            ["Date", "Spend", "Impressions", "Clicks", "Purchases", "Purchase value", "ROAS"],
+            table,
+        )
     )
 
 
@@ -737,7 +788,7 @@ def get_performance_breakdown(
         "demographics": "age × gender",
     }.get(key, key)
 
-    rows = _fetch_insights(
+    rows, campaign_note = _fetch_insights(
         level=level,
         start=start,
         end=end,
@@ -746,7 +797,7 @@ def get_performance_breakdown(
         campaign=campaign,
         time_increment="all_days",
     )
-    if campaign.strip() and not _fb().resolve_campaign_id(account_id, campaign):
+    if campaign.strip():
         rows = _filter_rows(rows, campaign=campaign)
 
     if key == "placement":
@@ -760,7 +811,10 @@ def get_performance_breakdown(
             r["age_gender"] = f"{r.get('age') or '?'}/{r.get('gender') or '?'}"
 
     if not rows:
-        return f"No data for breakdown by {label} in that range."
+        return _empty_report(
+            f"No data for breakdown by {label} in that range.",
+            campaign_note,
+        )
 
     buckets = _aggregate_metrics(rows, group_by=col)
     ranked = sorted(
@@ -769,21 +823,38 @@ def get_performance_breakdown(
         reverse=True,
     )[: max(1, min(limit, 100))]
 
-    table = [
-        [
-            name if name and name != "(blank)" else "(unnamed)",
-            _fmt_usd(v["amount_spent_usd"]),
-            _fmt_int(v["impressions"]),
-            _fmt_int(v["clicks_all"]),
-            _fmt_int(v["purchases"]),
-        ]
-        for name, v in ranked
-    ]
+    table = []
+    for name, v in ranked:
+        spend = float(v["amount_spent_usd"])
+        value = float(v["purchases_value"])
+        table.append(
+            [
+                name if name and name != "(blank)" else "(unnamed)",
+                _fmt_usd(spend),
+                _fmt_int(v["impressions"]),
+                _fmt_int(v["clicks_all"]),
+                _fmt_int(v["purchases"]),
+                _fmt_usd(value),
+                _fmt_roas(value, spend),
+            ]
+        )
     return (
-        f"Performance by {label} (Graph API)\n"
-        f"{start.isoformat()} to {end.isoformat()}\n"
+        _report_preamble(
+            f"Performance by {label} (Graph API)",
+            f"{start.isoformat()} to {end.isoformat()}",
+            campaign_note=campaign_note,
+        )
         + _table_lines(
-            [label.title(), "Spend", "Impressions", "Clicks", "Purchases"], table
+            [
+                label.title(),
+                "Spend",
+                "Impressions",
+                "Clicks",
+                "Purchases",
+                "Purchase value",
+                "ROAS",
+            ],
+            table,
         )
     )
 
@@ -810,7 +881,7 @@ def get_conversions_by_region(
         return "Unknown geo. Use geo=region|state|country|dma."
 
     start, end = _date_range(start_date, end_date)
-    rows = _fetch_insights(
+    rows, campaign_note = _fetch_insights(
         level="campaign",
         start=start,
         end=end,
@@ -819,13 +890,14 @@ def get_conversions_by_region(
         campaign=campaign,
         time_increment="all_days",
     )
-    if campaign.strip() and not _fb().resolve_campaign_id(account_id, campaign):
+    if campaign.strip():
         rows = _filter_rows(rows, campaign=campaign)
 
     if not rows:
-        return (
+        return _empty_report(
             f"No geographic conversion data ({geo_key}) in that range. "
-            "Confirm the account has delivery and purchase events."
+            "Confirm the account has delivery and purchase events.",
+            campaign_note,
         )
 
     buckets: dict[str, dict[str, float]] = defaultdict(
@@ -856,12 +928,14 @@ def get_conversions_by_region(
     for name, v in ranked:
         spend = float(v["amount_spent_usd"])
         purchases = int(v["purchases"])
+        value = float(v["purchases_value"])
         cpa = (spend / purchases) if purchases else 0.0
         table.append(
             [
                 name,
                 _fmt_int(purchases),
-                _fmt_usd(v["purchases_value"]),
+                _fmt_usd(value),
+                _fmt_roas(value, spend),
                 _fmt_usd(spend),
                 _fmt_usd(cpa) if purchases else "—",
                 _fmt_int(v["impressions"]),
@@ -872,12 +946,24 @@ def get_conversions_by_region(
     total_purchases = int(sum(v["purchases"] for _, v in buckets.items()))
     total_spend = sum(v["amount_spent_usd"] for _, v in buckets.items())
     return (
-        f"Conversions by {label.lower()} (Graph API breakdowns={geo_key})\n"
-        f"{start.isoformat()} to {end.isoformat()}\n"
-        f"Totals: {total_purchases:,} purchases · {_fmt_usd(total_spend)} spend · "
-        f"{len(buckets)} {label.lower()}(s)\n"
+        _report_preamble(
+            f"Conversions by {label.lower()} (Graph API breakdowns={geo_key})",
+            f"{start.isoformat()} to {end.isoformat()}",
+            f"Totals: {total_purchases:,} purchases · {_fmt_usd(total_spend)} spend · "
+            f"{len(buckets)} {label.lower()}(s)",
+            campaign_note=campaign_note,
+        )
         + _table_lines(
-            [label, "Purchases", "Purchase value", "Spend", "CPA", "Impressions", "Clicks"],
+            [
+                label,
+                "Purchases",
+                "Purchase value",
+                "ROAS",
+                "Spend",
+                "CPA",
+                "Impressions",
+                "Clicks",
+            ],
             table,
         )
     )
@@ -892,9 +978,9 @@ def get_top_ads(
     sort_by: str = "spend",
     limit: int = 20,
 ) -> str:
-    """Top-performing ads ranked by spend, impressions, clicks, or purchases."""
+    """Top ads ranked by spend, impressions, clicks, purchases, purchase value, or ROAS."""
     start, end = _date_range(start_date, end_date)
-    rows = _fetch_insights(
+    rows, campaign_note = _fetch_insights(
         level="ad",
         start=start,
         end=end,
@@ -902,10 +988,10 @@ def get_top_ads(
         campaign=campaign,
         time_increment="all_days",
     )
-    if campaign.strip() and not _fb().resolve_campaign_id(account_id, campaign):
+    if campaign.strip():
         rows = _filter_rows(rows, campaign=campaign)
     if not rows:
-        return "No ad-level data in that range."
+        return _empty_report("No ad-level data in that range.", campaign_note)
 
     buckets: dict[tuple[str, str, str], dict[str, float]] = defaultdict(
         lambda: {
@@ -913,6 +999,7 @@ def get_top_ads(
             "impressions": 0.0,
             "clicks_all": 0.0,
             "purchases": 0.0,
+            "purchases_value": 0.0,
         }
     )
     for r in rows:
@@ -921,17 +1008,34 @@ def get_top_ads(
             r.get("adset_name") or "",
             r.get("campaign_name") or "",
         )
-        for m in ("amount_spent_usd", "impressions", "clicks_all", "purchases"):
+        for m in (
+            "amount_spent_usd",
+            "impressions",
+            "clicks_all",
+            "purchases",
+            "purchases_value",
+        ):
             buckets[k][m] += float(r.get(m) or 0)
 
+    sort_name = (sort_by or "spend").lower().replace(" ", "_")
     sort_key = {
         "spend": "amount_spent_usd",
         "impressions": "impressions",
         "clicks": "clicks_all",
         "purchases": "purchases",
-    }.get((sort_by or "spend").lower(), "amount_spent_usd")
+        "purchase_value": "purchases_value",
+        "purchases_value": "purchases_value",
+        "value": "purchases_value",
+        "roas": "roas",
+    }.get(sort_name, "amount_spent_usd")
 
-    ranked = sorted(buckets.items(), key=lambda kv: kv[1][sort_key], reverse=True)[
+    def _top_ad_rank(metrics: dict[str, float]) -> float:
+        if sort_key == "roas":
+            spend = metrics["amount_spent_usd"]
+            return (metrics["purchases_value"] / spend) if spend else 0.0
+        return metrics[sort_key]
+
+    ranked = sorted(buckets.items(), key=lambda kv: _top_ad_rank(kv[1]), reverse=True)[
         : max(1, min(limit, 100))
     ]
     table = [
@@ -942,14 +1046,29 @@ def get_top_ads(
             _fmt_int(v["impressions"]),
             _fmt_int(v["clicks_all"]),
             _fmt_int(v["purchases"]),
+            _fmt_usd(v["purchases_value"]),
+            _fmt_roas(v["purchases_value"], v["amount_spent_usd"]),
         ]
         for (ad, adset, _), v in ranked
     ]
     return (
-        f"Top ads by {sort_by} (Graph API)\n"
-        f"{start.isoformat()} to {end.isoformat()}\n"
+        _report_preamble(
+            f"Top ads by {sort_by} (Graph API)",
+            f"{start.isoformat()} to {end.isoformat()}",
+            campaign_note=campaign_note,
+        )
         + _table_lines(
-            ["Ad", "Ad set", "Spend", "Impressions", "Clicks", "Purchases"], table
+            [
+                "Ad",
+                "Ad set",
+                "Spend",
+                "Impressions",
+                "Clicks",
+                "Purchases",
+                "Purchase value",
+                "ROAS",
+            ],
+            table,
         )
     )
 
@@ -1008,7 +1127,7 @@ def get_demographics_breakdown(
 
     breakdowns = "age,gender" if key == "age_gender" else key
     start, end = _date_range(start_date, end_date)
-    rows = _fetch_insights(
+    rows, campaign_note = _fetch_insights(
         level="campaign",
         start=start,
         end=end,
@@ -1017,10 +1136,13 @@ def get_demographics_breakdown(
         campaign=campaign,
         time_increment="all_days",
     )
-    if campaign.strip() and not _fb().resolve_campaign_id(account_id, campaign):
+    if campaign.strip():
         rows = _filter_rows(rows, campaign=campaign)
     if not rows:
-        return f"No demographic data ({key}) in that range."
+        return _empty_report(
+            f"No demographic data ({key}) in that range.",
+            campaign_note,
+        )
 
     for r in rows:
         if key == "age_gender":
@@ -1046,8 +1168,11 @@ def get_demographics_breakdown(
         for name, v in ranked
     ]
     return (
-        f"Demographics by {key} (Graph API)\n"
-        f"{start.isoformat()} to {end.isoformat()}\n"
+        _report_preamble(
+            f"Demographics by {key} (Graph API)",
+            f"{start.isoformat()} to {end.isoformat()}",
+            campaign_note=campaign_note,
+        )
         + _table_lines(
             [key.replace("_", " × ").title(), "Spend", "Impressions", "Reach", "Clicks", "Purchases"],
             table,
@@ -1073,7 +1198,7 @@ def get_hourly_performance(
         label = "advertiser timezone"
 
     start, end = _date_range(start_date, end_date)
-    rows = _fetch_insights(
+    rows, campaign_note = _fetch_insights(
         level="campaign",
         start=start,
         end=end,
@@ -1082,10 +1207,13 @@ def get_hourly_performance(
         campaign=campaign,
         time_increment="all_days",
     )
-    if campaign.strip() and not _fb().resolve_campaign_id(account_id, campaign):
+    if campaign.strip():
         rows = _filter_rows(rows, campaign=campaign)
     if not rows:
-        return f"No hourly data ({label}) in that range."
+        return _empty_report(
+            f"No hourly data ({label}) in that range.",
+            campaign_note,
+        )
 
     buckets = _aggregate_metrics(rows, group_by="hour")
     ranked = sorted(buckets.items(), key=lambda kv: kv[0])
@@ -1100,8 +1228,11 @@ def get_hourly_performance(
         for hour, v in ranked
     ]
     return (
-        f"Hourly performance ({label}, Graph API)\n"
-        f"{start.isoformat()} to {end.isoformat()}\n"
+        _report_preamble(
+            f"Hourly performance ({label}, Graph API)",
+            f"{start.isoformat()} to {end.isoformat()}",
+            campaign_note=campaign_note,
+        )
         + _table_lines(["Hour", "Spend", "Impressions", "Clicks", "Purchases"], table)
     )
 
@@ -1229,7 +1360,7 @@ def get_reach_frequency(
         col = "account"
 
     start, end = _date_range(start_date, end_date)
-    rows = _fetch_insights(
+    rows, campaign_note = _fetch_insights(
         level=level if key != "account" else "account",
         start=start,
         end=end,
@@ -1237,10 +1368,13 @@ def get_reach_frequency(
         campaign=campaign,
         time_increment="all_days",
     )
-    if campaign.strip() and not _fb().resolve_campaign_id(account_id, campaign):
+    if campaign.strip():
         rows = _filter_rows(rows, campaign=campaign)
     if not rows:
-        return "No reach/frequency data in that range."
+        return _empty_report(
+            "No reach/frequency data in that range.",
+            campaign_note,
+        )
 
     if key == "account":
         for r in rows:
@@ -1299,9 +1433,12 @@ def get_reach_frequency(
             ]
         )
     return (
-        f"Reach & frequency by {key} (Graph API)\n"
-        f"{start.isoformat()} to {end.isoformat()}\n"
-        f"Note: reach is non-additive across rows when broken down.\n"
+        _report_preamble(
+            f"Reach & frequency by {key} (Graph API)",
+            f"{start.isoformat()} to {end.isoformat()}",
+            "Note: reach is non-additive across rows when broken down.",
+            campaign_note=campaign_note,
+        )
         + _table_lines(
             [key.title(), "Reach", "Frequency", "Impressions", "Spend", "Purchases"],
             table,

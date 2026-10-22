@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import time
+from dataclasses import dataclass
 from datetime import date
 from typing import Any, Optional
 from urllib.parse import urlencode
@@ -55,6 +56,60 @@ PURCHASE_FALLBACK = "purchase"
 
 class MetaGraphError(Exception):
     """Facebook Graph API error."""
+
+
+@dataclass
+class CampaignScope:
+    """How a campaign argument maps onto insights.
+
+    campaign_id is set only for a numeric id, a unique exact name, or a unique
+    partial name. Several name matches leave campaign_id empty so the caller
+    aggregates every campaign whose name contains the query.
+    """
+
+    query: str
+    campaign_id: Optional[str] = None
+    matched: int = 0
+    truncated: bool = False
+
+    def note(self) -> str:
+        if not self.query:
+            return ""
+        if self.campaign_id:
+            return f"Campaign filter: {self.query} (1 campaign)"
+        if self.matched > 0:
+            count = f"{self.matched}+" if self.truncated else str(self.matched)
+            noun = "campaign" if count == "1" else "campaigns"
+            return f"Campaign filter: {self.query} ({count} {noun}, contains)"
+        return f"Campaign filter: {self.query} (contains; no campaign name matched)"
+
+
+def select_campaign_scope(
+    campaign: str,
+    rows: list[dict[str, Any]],
+    *,
+    truncated: bool = False,
+) -> CampaignScope:
+    """Pick one campaign id, or a contains-match over every returned name."""
+    q = (campaign or "").strip()
+    q_lower = q.lower()
+    exact = [r for r in rows if (r.get("name") or "").lower() == q_lower]
+    if len(exact) == 1 and not truncated:
+        return CampaignScope(
+            query=q, campaign_id=str(exact[0].get("id") or "") or None, matched=1
+        )
+    pool = exact if len(exact) > 1 else [
+        r for r in rows if q_lower in (r.get("name") or "").lower()
+    ]
+    if len(pool) == 1 and not truncated:
+        return CampaignScope(
+            query=q, campaign_id=str(pool[0].get("id") or "") or None, matched=1
+        )
+    if pool:
+        return CampaignScope(
+            query=q, campaign_id=None, matched=len(pool), truncated=truncated
+        )
+    return CampaignScope(query=q, campaign_id=None, matched=0, truncated=truncated)
 
 
 def _get_act(actions: Optional[list[dict]], action_type: str) -> float:
@@ -405,35 +460,25 @@ class MetaGraphClient:
         raw = self._paginate(f"{run_id}/insights", {"limit": 500})
         return [normalize_insight_row(r) for r in raw]
 
-    def resolve_campaign_id(self, account_id: str, campaign: str) -> Optional[str]:
-        """Resolve campaign name (or id) to Graph campaign id (D-5)."""
+    def resolve_campaign_scope(self, account_id: str, campaign: str) -> CampaignScope:
+        """Resolve a campaign argument to one id, or a contains-match over many."""
         q = (campaign or "").strip()
         if not q:
-            return None
+            return CampaignScope(query="")
         if q.isdigit() or q.startswith("120"):
-            return q.removeprefix("act_")
-
+            return CampaignScope(
+                query=q, campaign_id=q.removeprefix("act_"), matched=1
+            )
         rows = self.list_campaign_objects(account_id=account_id, search=q, limit=200)
-        q_lower = q.lower()
-        exact = [r for r in rows if (r.get("name") or "").lower() == q_lower]
-        if exact:
-            return exact[0].get("id")
-        partial = [
-            r for r in rows if q_lower in (r.get("name") or "").lower()
-        ]
-        if len(partial) == 1:
-            return partial[0].get("id")
-        if partial:
-            # Prefer ACTIVE exact-ish match
-            active = [
-                r
-                for r in partial
-                if (r.get("status") or "").upper() == "ACTIVE"
-            ]
-            if len(active) == 1:
-                return active[0].get("id")
-            return partial[0].get("id")
-        return None
+        return select_campaign_scope(q, rows, truncated=len(rows) >= 200)
+
+    def resolve_campaign_id(self, account_id: str, campaign: str) -> Optional[str]:
+        """Resolve a numeric id, exact name, or unique partial name to one campaign id.
+
+        A substring that matches several campaigns returns None so callers
+        include every match instead of the first one (D-5).
+        """
+        return self.resolve_campaign_scope(account_id, campaign).campaign_id
 
     def fetch_insights_for_campaign(
         self,
@@ -445,21 +490,21 @@ class MetaGraphClient:
         until: date,
         breakdowns: Optional[str] = None,
         time_increment: Any = 1,
-    ) -> list[dict[str, Any]]:
-        """Fetch insights filtered to one campaign (D-5)."""
-        campaign_id = self.resolve_campaign_id(account_id, campaign)
-        if campaign_id:
-            return self.fetch_insights(
+    ) -> tuple[list[dict[str, Any]], CampaignScope]:
+        """Fetch insights for one campaign, or every name that contains the query."""
+        scope = self.resolve_campaign_scope(account_id, campaign)
+        if scope.campaign_id:
+            rows = self.fetch_insights(
                 account_id,
                 level=level,
                 since=since,
                 until=until,
                 breakdowns=breakdowns,
                 time_increment=time_increment,
-                object_id=campaign_id,
+                object_id=scope.campaign_id,
             )
-        # Fallback: account-level filtering by campaign name
-        return self.fetch_insights(
+            return rows, scope
+        rows = self.fetch_insights(
             account_id,
             level=level,
             since=since,
@@ -474,6 +519,7 @@ class MetaGraphClient:
                 }
             ],
         )
+        return rows, scope
 
     _AD_ACCOUNT_FIELDS = (
         "account_id,name,account_status,currency,"
