@@ -99,7 +99,8 @@ Reload MCP in Cursor settings after starting the server.
 | `list_accounts` | Ad accounts + parent Business Manager |
 | `list_campaigns` | Campaigns in an ad account |
 | `list_adsets` | Ad sets in an ad account |
-| `list_creatives` | Ads + creative thumbnails / preview URLs |
+| `list_creatives` | Ads + full creative image / preview / Ads Manager URLs |
+| `get_creative_images` | Download creative stills on the connector (base64 for sheet screenshots) |
 | `get_integration_status` | Token / app health check |
 | `get_ads_summary` | KPI totals for a date range |
 | `get_daily_trend` | Day-by-day spend & metrics |
@@ -123,7 +124,8 @@ Reload MCP in Cursor settings after starting the server.
 - "Hourly performance yesterday"
 - "Age and gender breakdown last week"
 - "Conversions by state for yesterday"
-- "Show creatives with preview URLs"
+- "Show creatives with full image and preview URLs"
+- "Download creative images for these ads so I can put screenshots in a sheet"
 - "Who does the Prospecting ad set target?"
 - "Campaign budgets and status"
 - "Pause campaign 120…" / "Activate campaign 120…"

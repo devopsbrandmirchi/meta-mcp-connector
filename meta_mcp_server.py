@@ -458,7 +458,8 @@ ACCOUNTS
 CAMPAIGNS, AD SETS & CREATIVES
 - "List campaigns for Drag Race"
 - "List ad sets"
-- "Show ads / creatives with preview URLs"
+- "Show ads / creatives with full image and preview URLs"
+- "Download creative images for these ads so I can put screenshots in a sheet"
 - "Who does this ad set target?"
 - "Campaign budgets and status"
 - "Pause campaign X" / "Activate campaign X" (needs ads_management)
@@ -1079,7 +1080,12 @@ def list_creatives(
     account_id: str = "",
     limit: int = 25,
 ) -> str:
-    """List ads with creative thumbnails, preview URLs, and Ads Manager links."""
+    """
+    List ads with full creative image / preview / Ads Manager URLs (not truncated).
+
+    For embedding screenshots in a spreadsheet, use get_creative_images instead —
+    that tool downloads the image on the connector and returns base64.
+    """
     rows = _fb().list_ad_creatives(
         account_id=account_id,
         search=search,
@@ -1088,25 +1094,104 @@ def list_creatives(
     )
     if not rows:
         return "No ads/creatives found."
-    body = [
-        [
-            (r.get("ad_name") or "")[:40],
-            r.get("ad_id") or "",
-            r.get("status") or "",
-            (r.get("title") or "")[:30],
-            r.get("cta") or "",
-            (r.get("thumbnail_url") or r.get("image_url") or "")[:60] or "—",
-            (r.get("preview_url") or r.get("ads_manager_url") or "")[:70] or "—",
-        ]
-        for r in rows
+    lines = [
+        f"Found {len(rows)} ad creative(s).",
+        "URLs below are complete (not truncated).",
+        "For sheet screenshots, call get_creative_images so the connector downloads the file.",
+        "",
     ]
-    return (
-        f"Found {len(rows)} ad creative(s).\n"
-        + _table_lines(
-            ["Ad", "Ad ID", "Status", "Title", "CTA", "Thumbnail", "Preview / Ads Manager"],
-            body,
+    for i, r in enumerate(rows, 1):
+        image = (
+            str(r.get("best_image_url") or "").strip()
+            or str(r.get("image_url") or "").strip()
+            or str(r.get("thumbnail_url") or "").strip()
+            or "—"
         )
+        lines.extend(
+            [
+                f"{i}. {(r.get('ad_name') or '(unnamed)').strip()}",
+                f"   Ad ID: {r.get('ad_id') or '—'}",
+                f"   Status: {r.get('status') or '—'}",
+                f"   Title: {(r.get('title') or '—')}",
+                f"   CTA: {r.get('cta') or '—'}",
+                f"   Image: {image}",
+                f"   Thumbnail: {r.get('thumbnail_url') or '—'}",
+                f"   Preview: {r.get('preview_url') or '—'}",
+                f"   Ads Manager: {r.get('ads_manager_url') or '—'}",
+                "",
+            ]
+        )
+    return "\n".join(lines).rstrip()
+
+
+@mcp.tool()
+def get_creative_images(
+    search: str = "",
+    ad_ids: str = "",
+    account_id: str = "",
+    limit: int = 10,
+) -> str:
+    """
+    Download creative images on the connector and return base64 for sheet embedding.
+
+    Use this when Claude cannot fetch Meta CDN URLs. Pass search (name contains)
+    and/or comma/space-separated ad_ids. Limit is capped at 20.
+    """
+    raw_ids = (
+        (ad_ids or "")
+        .replace(";", " ")
+        .replace(",", " ")
+        .replace("\n", " ")
     )
+    ids = [part for part in raw_ids.split() if part]
+    if not ids and not search.strip():
+        return (
+            "Pass search (ad name contains) and/or ad_ids "
+            "(comma-separated Graph ad ids)."
+        )
+    try:
+        rows = _fb().fetch_creative_images(
+            account_id=account_id,
+            search=search,
+            limit=max(1, min(int(limit or 10), 20)),
+            ad_ids=ids or None,
+        )
+    except (MetaGraphError, ValueError, RuntimeError) as e:
+        return f"Failed to fetch creative images: {e}"
+    if not rows:
+        return "No ads/creatives found for that search or ad_ids."
+
+    ok_n = sum(1 for r in rows if r.get("ok"))
+    lines = [
+        f"Creative images: {ok_n}/{len(rows)} downloaded on the connector.",
+        "Each ok=true block includes image_base64 for embedding in a sheet.",
+        "Video-only creatives may have no still image.",
+        "",
+    ]
+    for i, r in enumerate(rows, 1):
+        lines.append(f"--- Ad {i}: {(r.get('ad_name') or '(unnamed)').strip()} ---")
+        lines.append(f"ad_id: {r.get('ad_id') or '—'}")
+        lines.append(f"status: {r.get('status') or '—'}")
+        lines.append(f"campaign_id: {r.get('campaign_id') or '—'}")
+        lines.append(f"title: {r.get('title') or '—'}")
+        lines.append(f"cta: {r.get('cta') or '—'}")
+        lines.append(f"image_url: {r.get('image_url') or '—'}")
+        lines.append(f"ads_manager_url: {r.get('ads_manager_url') or '—'}")
+        if r.get("ok"):
+            lines.append(f"ok: true")
+            lines.append(f"mime_type: {r.get('mime_type') or '—'}")
+            lines.append(f"byte_size: {r.get('byte_size') or 0}")
+            lines.append(f"image_base64: {r.get('image_base64') or ''}")
+        else:
+            lines.append("ok: false")
+            lines.append(f"error: {r.get('error') or 'unknown error'}")
+            if r.get("video_id"):
+                lines.append(
+                    f"video_id: {r.get('video_id')} "
+                    "(no image download for video files)"
+                )
+        lines.append("")
+    return "\n".join(lines).rstrip()
 
 
 @mcp.tool()
@@ -1752,6 +1837,7 @@ if __name__ == "__main__":
         "list_campaigns",
         "list_adsets",
         "list_creatives",
+        "get_creative_images",
         "get_integration_status",
         "get_ads_summary",
         "get_daily_trend",

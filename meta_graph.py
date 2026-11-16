@@ -7,6 +7,7 @@ app token via client_credentials when no user token is set.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -22,6 +23,9 @@ FB_API_VERSION = os.environ.get("FACEBOOK_API_VERSION", "v21.0").strip() or "v21
 FB_BASE = f"https://graph.facebook.com/{FB_API_VERSION}"
 
 logger = logging.getLogger("meta-graph")
+
+# Cap creative image downloads so MCP responses stay usable for Claude sheets.
+CREATIVE_IMAGE_MAX_BYTES = 5 * 1024 * 1024
 
 # Core insight fields. Name fields are required when level is set — without them
 # Graph returns blank campaign/adset/ad names (defect D-2 / D-3).
@@ -748,6 +752,92 @@ class MetaGraphClient:
         rows = self._paginate(f"act_{act}/adsets", params)
         return rows[:limit] if limit else rows
 
+    _AD_CREATIVE_FIELDS = (
+        "id,name,status,effective_status,adset_id,campaign_id,"
+        "creative{id,name,thumbnail_url,image_url,image_hash,object_type,"
+        "title,body,call_to_action_type,link_url,video_id,"
+        "object_story_spec,asset_feed_spec}"
+    )
+
+    @staticmethod
+    def _collect_image_hashes(creative: dict[str, Any]) -> list[str]:
+        """Gather image hashes from a creative and nested story / feed specs."""
+        hashes: list[str] = []
+        seen: set[str] = set()
+
+        def add(value: Any) -> None:
+            h = str(value or "").strip()
+            if h and h not in seen:
+                seen.add(h)
+                hashes.append(h)
+
+        add(creative.get("image_hash"))
+        story = creative.get("object_story_spec")
+        if isinstance(story, dict):
+            for key in ("link_data", "video_data", "photo_data"):
+                block = story.get(key)
+                if isinstance(block, dict):
+                    add(block.get("image_hash"))
+                    add(block.get("hash"))
+        feed = creative.get("asset_feed_spec")
+        if isinstance(feed, dict):
+            for img in feed.get("images") or []:
+                if isinstance(img, dict):
+                    add(img.get("hash"))
+                    add(img.get("image_hash"))
+            for vid in feed.get("videos") or []:
+                if isinstance(vid, dict):
+                    add(vid.get("thumbnail_hash"))
+                    add(vid.get("image_hash"))
+        return hashes
+
+    def resolve_adimage_urls(
+        self, account_id: str, hashes: list[str]
+    ) -> dict[str, str]:
+        """Map image hashes to permalink/url via act_*/adimages."""
+        act = self.resolve_account_id(account_id)
+        unique = [h for h in dict.fromkeys(hashes) if h]
+        if not unique:
+            return {}
+        out: dict[str, str] = {}
+        # Graph accepts a JSON array of hashes; batch to keep query size sane.
+        for i in range(0, len(unique), 50):
+            batch = unique[i : i + 50]
+            try:
+                data = self._graph_get(
+                    f"act_{act}/adimages",
+                    {
+                        "hashes": json.dumps(batch, separators=(",", ":")),
+                        "fields": "hash,url,permalink_url,name",
+                        "limit": min(len(batch), 100),
+                    },
+                )
+            except MetaGraphError as exc:
+                logger.warning("adimages lookup failed: %s", exc)
+                continue
+            for row in data.get("data") or []:
+                if not isinstance(row, dict):
+                    continue
+                h = str(row.get("hash") or "").strip()
+                url = str(row.get("permalink_url") or row.get("url") or "").strip()
+                if h and url:
+                    out[h] = url
+        return out
+
+    def _best_image_url(
+        self,
+        creative: dict[str, Any],
+        hash_urls: dict[str, str],
+    ) -> str:
+        direct = str(creative.get("image_url") or "").strip()
+        if direct:
+            return direct
+        for h in self._collect_image_hashes(creative):
+            url = hash_urls.get(h)
+            if url:
+                return url
+        return str(creative.get("thumbnail_url") or "").strip()
+
     def list_ad_creatives(
         self,
         account_id: str = "",
@@ -755,31 +845,48 @@ class MetaGraphClient:
         limit: int = 50,
         *,
         include_preview: bool = True,
+        ad_ids: Optional[list[str]] = None,
     ) -> list[dict[str, Any]]:
-        """List ads with creative thumbnail / preview info."""
+        """List ads with creative thumbnail / full image URLs."""
         act = self.resolve_account_id(account_id)
-        params: dict[str, Any] = {
-            "fields": (
-                "id,name,status,effective_status,adset_id,campaign_id,"
-                "creative{id,name,thumbnail_url,image_url,object_type,"
-                "title,body,call_to_action_type,link_url,video_id}"
-            ),
-            "limit": min(max(limit, 1), 100),
-        }
-        if search.strip():
-            params["filtering"] = json.dumps(
-                [
-                    {
-                        "field": "name",
-                        "operator": "CONTAIN",
-                        "value": search.strip(),
-                    }
-                ]
-            )
-        rows = self._paginate(f"act_{act}/ads", params)
+        rows: list[dict[str, Any]] = []
+        wanted = [str(a).strip() for a in (ad_ids or []) if str(a).strip()]
+        if wanted:
+            for ad_id in wanted[: max(1, min(limit, 100))]:
+                try:
+                    row = self._graph_get(ad_id, {"fields": self._AD_CREATIVE_FIELDS})
+                    if isinstance(row, dict) and row.get("id"):
+                        rows.append(row)
+                except MetaGraphError as exc:
+                    logger.warning("Failed to load ad %s: %s", ad_id, exc)
+        else:
+            params: dict[str, Any] = {
+                "fields": self._AD_CREATIVE_FIELDS,
+                "limit": min(max(limit, 1), 100),
+            }
+            if search.strip():
+                params["filtering"] = json.dumps(
+                    [
+                        {
+                            "field": "name",
+                            "operator": "CONTAIN",
+                            "value": search.strip(),
+                        }
+                    ]
+                )
+            rows = self._paginate(f"act_{act}/ads", params)
+
+        creatives = [
+            row.get("creative") if isinstance(row.get("creative"), dict) else {}
+            for row in rows[:limit]
+        ]
+        all_hashes: list[str] = []
+        for creative in creatives:
+            all_hashes.extend(self._collect_image_hashes(creative))
+        hash_urls = self.resolve_adimage_urls(act, all_hashes)
+
         out: list[dict[str, Any]] = []
-        for row in rows[:limit]:
-            creative = row.get("creative") if isinstance(row.get("creative"), dict) else {}
+        for row, creative in zip(rows[:limit], creatives):
             ad_id = str(row.get("id") or "")
             preview_url = ""
             if include_preview and ad_id:
@@ -797,6 +904,9 @@ class MetaGraphClient:
                             preview_url = html.split('src="', 1)[1].split('"', 1)[0]
                 except MetaGraphError:
                     preview_url = ""
+            image_url = str(creative.get("image_url") or "").strip()
+            thumbnail_url = str(creative.get("thumbnail_url") or "").strip()
+            best_image_url = self._best_image_url(creative, hash_urls)
             out.append(
                 {
                     "ad_id": ad_id,
@@ -806,8 +916,10 @@ class MetaGraphClient:
                     "campaign_id": row.get("campaign_id") or "",
                     "creative_id": creative.get("id") or "",
                     "creative_name": creative.get("name") or "",
-                    "thumbnail_url": creative.get("thumbnail_url") or "",
-                    "image_url": creative.get("image_url") or "",
+                    "thumbnail_url": thumbnail_url,
+                    "image_url": image_url,
+                    "best_image_url": best_image_url,
+                    "image_hashes": self._collect_image_hashes(creative),
                     "title": creative.get("title") or "",
                     "body": creative.get("body") or "",
                     "cta": creative.get("call_to_action_type") or "",
@@ -822,6 +934,97 @@ class MetaGraphClient:
                     ),
                 }
             )
+        return out
+
+    def download_image_bytes(
+        self, url: str, *, max_bytes: int = CREATIVE_IMAGE_MAX_BYTES
+    ) -> dict[str, Any]:
+        """Download an image URL on the connector (bypasses Claude CDN blocks)."""
+        target = (url or "").strip()
+        if not target:
+            raise MetaGraphError("image url is empty")
+        with httpx.Client(timeout=60.0, follow_redirects=True) as client:
+            res = client.get(target)
+        if not res.is_success:
+            raise MetaGraphError(f"Image download HTTP {res.status_code}")
+        content = res.content or b""
+        if len(content) > max_bytes:
+            raise MetaGraphError(
+                f"Image exceeds {max_bytes} bytes ({len(content)} bytes)"
+            )
+        if not content:
+            raise MetaGraphError("Image download returned empty body")
+        mime = (res.headers.get("content-type") or "").split(";")[0].strip().lower()
+        if not mime.startswith("image/"):
+            if content[:3] == b"\xff\xd8\xff":
+                mime = "image/jpeg"
+            elif content[:8] == b"\x89PNG\r\n\x1a\n":
+                mime = "image/png"
+            elif content[:6] in (b"GIF87a", b"GIF89a"):
+                mime = "image/gif"
+            elif content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+                mime = "image/webp"
+            else:
+                mime = mime or "application/octet-stream"
+        return {
+            "mime_type": mime,
+            "byte_size": len(content),
+            "image_base64": base64.b64encode(content).decode("ascii"),
+        }
+
+    def fetch_creative_images(
+        self,
+        account_id: str = "",
+        search: str = "",
+        limit: int = 20,
+        *,
+        ad_ids: Optional[list[str]] = None,
+    ) -> list[dict[str, Any]]:
+        """Resolve creatives and download best image bytes for each ad."""
+        rows = self.list_ad_creatives(
+            account_id=account_id,
+            search=search,
+            limit=max(1, min(limit, 20)),
+            include_preview=False,
+            ad_ids=ad_ids,
+        )
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            image_url = (
+                str(row.get("best_image_url") or "").strip()
+                or str(row.get("image_url") or "").strip()
+                or str(row.get("thumbnail_url") or "").strip()
+            )
+            item: dict[str, Any] = {
+                "ad_id": row.get("ad_id") or "",
+                "ad_name": row.get("ad_name") or "",
+                "status": row.get("status") or "",
+                "campaign_id": row.get("campaign_id") or "",
+                "creative_id": row.get("creative_id") or "",
+                "title": row.get("title") or "",
+                "cta": row.get("cta") or "",
+                "video_id": row.get("video_id") or "",
+                "image_url": image_url,
+                "ads_manager_url": row.get("ads_manager_url") or "",
+                "ok": False,
+                "error": "",
+                "mime_type": "",
+                "byte_size": 0,
+                "image_base64": "",
+            }
+            if not image_url:
+                item["error"] = "No image URL on this creative (video-only or empty)."
+                out.append(item)
+                continue
+            try:
+                downloaded = self.download_image_bytes(image_url)
+                item.update(downloaded)
+                item["ok"] = True
+            except MetaGraphError as exc:
+                item["error"] = str(exc)
+            except Exception as exc:  # noqa: BLE001 — surface download failures per ad
+                item["error"] = f"Download failed: {exc}"
+            out.append(item)
         return out
 
     def get_adset_targeting(
