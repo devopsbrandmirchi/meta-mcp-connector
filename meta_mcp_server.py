@@ -464,6 +464,7 @@ CAMPAIGNS, AD SETS & CREATIVES
 - "Campaign budgets and status"
 - "Create a PAUSED Meta campaign named CH_US_TEST with objective OUTCOME_SALES"
 - "Create a PAUSED ad set under campaign 120… targeting US ages 18-65"
+- "Create a PAUSED ad under ad set 120… using creative 120…"
 - "Pause campaign X" / "Activate campaign X" (needs ads_management)
 
 PERFORMANCE (live from Facebook Graph API)
@@ -1514,6 +1515,85 @@ def create_adset(
 
 
 @mcp.tool()
+def create_ad(
+    name: str,
+    adset_id: str,
+    account_id: str = "",
+    status: str = "PAUSED",
+    creative_id: str = "",
+    page_id: str = "",
+    link_url: str = "",
+    message: str = "",
+    image_hash: str = "",
+    image_url: str = "",
+    headline: str = "",
+    description: str = "",
+    cta: str = "LEARN_MORE",
+    creative_name: str = "",
+) -> str:
+    """
+    Create a Meta ad under an existing ad set (ads_management). Defaults to PAUSED.
+
+    Path A: pass creative_id to reuse an existing creative (wins if also Path B fields).
+    Path B: page_id + link_url + message + image_hash or public image_url (uploads first).
+    Optional headline, description, cta (default LEARN_MORE). Link/image ads only.
+    """
+    desired = (status or "PAUSED").strip().upper() or "PAUSED"
+    try:
+        row = _fb().create_ad(
+            name,
+            adset_id,
+            account_id=account_id,
+            status=desired,
+            creative_id=creative_id,
+            page_id=page_id,
+            link_url=link_url,
+            message=message,
+            image_hash=image_hash,
+            image_url=image_url,
+            headline=headline,
+            description=description,
+            cta=cta,
+            creative_name=creative_name,
+        )
+    except MetaGraphError as e:
+        return (
+            f"Failed to create ad: {e}\n"
+            "Ensure FACEBOOK_ACCESS_TOKEN has ads_management, adset_id is valid, "
+            "and either creative_id or page_id+link_url+message+image are set. "
+            "image_url must be publicly reachable by Meta."
+        )
+
+    lines = [
+        "Meta ad created (Graph API)",
+        f"Ad ID: {row.get('ad_id')}",
+        f"Name: {row.get('ad_name')}",
+        f"Ad set ID: {row.get('adset_id')}",
+        f"Creative ID: {row.get('creative_id')}",
+        f"Status: {row.get('status')}",
+        f"Account: {row.get('account_id')}",
+    ]
+    if row.get("creative_created"):
+        lines.append("Creative: newly created link creative")
+    else:
+        lines.append("Creative: reused existing creative_id")
+    if row.get("image_hash"):
+        lines.append(f"Image hash: {row.get('image_hash')}")
+    if row.get("link_url"):
+        lines.append(f"Link: {row.get('link_url')}")
+    if row.get("cta"):
+        lines.append(f"CTA: {row.get('cta')}")
+    lines.append(f"Ads Manager: {row.get('ads_manager_url')}")
+    lines.append(
+        "Note: ad is PAUSED by default — activate campaign, ad set, and ad with "
+        "set_object_status when ready to spend."
+        if (row.get("status") or "").upper() == "PAUSED"
+        else "Note: ad is ACTIVE; confirm parent campaign and ad set are also ACTIVE."
+    )
+    return "\n".join(lines)
+
+
+@mcp.tool()
 def set_object_status(
     object_id: str,
     status: str,
@@ -2008,6 +2088,7 @@ if __name__ == "__main__":
         "get_campaign_budgets",
         "create_campaign",
         "create_adset",
+        "create_ad",
         "set_object_status",
         "get_adset_targeting",
         "get_multi_account_spend",

@@ -1161,6 +1161,20 @@ class MetaGraphClient:
             "APP_INSTALLS",
         }
     )
+    AD_CTA_TYPES = frozenset(
+        {
+            "LEARN_MORE",
+            "SHOP_NOW",
+            "SIGN_UP",
+            "SUBSCRIBE",
+            "CONTACT_US",
+            "DOWNLOAD",
+            "BOOK_NOW",
+            "GET_OFFER",
+            "APPLY_NOW",
+            "BUY_NOW",
+        }
+    )
 
     @staticmethod
     def _budget_display(raw: Any) -> str:
@@ -1509,6 +1523,227 @@ class MetaGraphClient:
                 }
             )
         return out
+
+    def upload_ad_image_from_url(
+        self, image_url: str, *, account_id: str = ""
+    ) -> dict[str, Any]:
+        """Upload a public image URL into the ad account library → image_hash."""
+        url = (image_url or "").strip()
+        if not url:
+            raise MetaGraphError("image_url is required")
+        if not url.startswith(("http://", "https://")):
+            raise MetaGraphError("image_url must be an http(s) URL")
+        act = self.resolve_account_id(account_id)
+        data = self._graph_post(f"act_{act}/adimages", {"url": url})
+        images = data.get("images")
+        if isinstance(images, dict) and images:
+            # Response is {hash: {hash, url, ...}, ...}
+            first = next(iter(images.values()))
+            if isinstance(first, dict):
+                image_hash = str(first.get("hash") or "").strip()
+                if image_hash:
+                    return {
+                        "image_hash": image_hash,
+                        "url": str(first.get("url") or url),
+                        "name": str(first.get("name") or ""),
+                        "account_id": f"act_{act}",
+                        "raw": data,
+                    }
+        # Some API versions return hash at top level
+        image_hash = str(data.get("hash") or "").strip()
+        if image_hash:
+            return {
+                "image_hash": image_hash,
+                "url": url,
+                "name": "",
+                "account_id": f"act_{act}",
+                "raw": data,
+            }
+        raise MetaGraphError(f"adimages upload returned no hash: {data}")
+
+    def create_ad_creative(
+        self,
+        *,
+        page_id: str,
+        link_url: str,
+        message: str,
+        image_hash: str,
+        account_id: str = "",
+        name: str = "",
+        headline: str = "",
+        description: str = "",
+        cta: str = "LEARN_MORE",
+    ) -> dict[str, Any]:
+        """Create a link-ad creative (object_story_spec.link_data)."""
+        pid = (page_id or "").strip()
+        link = (link_url or "").strip()
+        body = (message or "").strip()
+        img_hash = (image_hash or "").strip()
+        if not pid:
+            raise MetaGraphError("page_id is required to create a link creative")
+        if not link:
+            raise MetaGraphError("link_url is required to create a link creative")
+        if not body:
+            raise MetaGraphError("message is required to create a link creative")
+        if not img_hash:
+            raise MetaGraphError("image_hash is required to create a link creative")
+
+        cta_type = (cta or "LEARN_MORE").strip().upper() or "LEARN_MORE"
+        if cta_type not in self.AD_CTA_TYPES:
+            allowed = ", ".join(sorted(self.AD_CTA_TYPES))
+            raise MetaGraphError(f"Unknown cta {cta!r}. Use one of: {allowed}")
+
+        creative_name = (name or "").strip() or f"Creative {pid}"
+        link_data: dict[str, Any] = {
+            "image_hash": img_hash,
+            "link": link,
+            "message": body,
+            "call_to_action": {
+                "type": cta_type,
+                "value": {"link": link},
+            },
+        }
+        headline_text = (headline or "").strip()
+        if headline_text:
+            link_data["name"] = headline_text
+        desc = (description or "").strip()
+        if desc:
+            link_data["description"] = desc
+
+        act = self.resolve_account_id(account_id)
+        object_story_spec = {"page_id": pid, "link_data": link_data}
+        params: dict[str, Any] = {
+            "name": creative_name,
+            "object_story_spec": json.dumps(object_story_spec, separators=(",", ":")),
+        }
+        data = self._graph_post(f"act_{act}/adcreatives", params)
+        creative_id = str(data.get("id") or "").strip()
+        if not creative_id:
+            raise MetaGraphError(f"Ad creative create returned no id: {data}")
+        return {
+            "creative_id": creative_id,
+            "creative_name": creative_name,
+            "page_id": pid,
+            "link_url": link,
+            "image_hash": img_hash,
+            "cta": cta_type,
+            "account_id": f"act_{act}",
+            "raw": data,
+        }
+
+    def create_ad(
+        self,
+        name: str,
+        adset_id: str,
+        *,
+        account_id: str = "",
+        status: str = "PAUSED",
+        creative_id: str = "",
+        page_id: str = "",
+        link_url: str = "",
+        message: str = "",
+        image_hash: str = "",
+        image_url: str = "",
+        headline: str = "",
+        description: str = "",
+        cta: str = "LEARN_MORE",
+        creative_name: str = "",
+    ) -> dict[str, Any]:
+        """
+        Create a Meta ad under an existing ad set (needs ads_management).
+
+        Path A: pass creative_id to reuse an existing creative.
+        Path B: pass page_id + link_url + message + image_hash or image_url.
+        creative_id wins when both are provided. Defaults to PAUSED.
+        """
+        ad_name = (name or "").strip()
+        if not ad_name:
+            raise MetaGraphError("Ad name is required")
+        aset_id = (adset_id or "").strip()
+        if not aset_id:
+            raise MetaGraphError("adset_id is required")
+
+        desired = (status or "PAUSED").strip().upper() or "PAUSED"
+        if desired not in ("ACTIVE", "PAUSED"):
+            raise MetaGraphError("status must be ACTIVE or PAUSED")
+
+        act = self.resolve_account_id(account_id)
+        cid = (creative_id or "").strip()
+        uploaded_hash = ""
+        created_creative: Optional[dict[str, Any]] = None
+
+        if not cid:
+            img_hash = (image_hash or "").strip()
+            img_url = (image_url or "").strip()
+            if not img_hash and img_url:
+                uploaded = self.upload_ad_image_from_url(img_url, account_id=act)
+                img_hash = str(uploaded.get("image_hash") or "")
+                uploaded_hash = img_hash
+            if not (
+                (page_id or "").strip()
+                and (link_url or "").strip()
+                and (message or "").strip()
+                and img_hash
+            ):
+                raise MetaGraphError(
+                    "Pass creative_id, or page_id + link_url + message + "
+                    "image_hash (or image_url) to create a link creative."
+                )
+            created_creative = self.create_ad_creative(
+                page_id=page_id,
+                link_url=link_url,
+                message=message,
+                image_hash=img_hash,
+                account_id=act,
+                name=(creative_name or "").strip() or ad_name,
+                headline=headline,
+                description=description,
+                cta=cta,
+            )
+            cid = str(created_creative.get("creative_id") or "")
+            if not uploaded_hash:
+                uploaded_hash = img_hash
+
+        if not cid:
+            raise MetaGraphError("creative_id could not be resolved")
+
+        params: dict[str, Any] = {
+            "name": ad_name,
+            "adset_id": aset_id,
+            "status": desired,
+            "creative": json.dumps({"creative_id": cid}, separators=(",", ":")),
+        }
+        data = self._graph_post(f"act_{act}/ads", params)
+        ad_id = str(data.get("id") or "").strip()
+        if not ad_id:
+            raise MetaGraphError(f"Ad create returned no id: {data}")
+
+        return {
+            "ad_id": ad_id,
+            "ad_name": ad_name,
+            "adset_id": aset_id,
+            "creative_id": cid,
+            "status": desired,
+            "account_id": f"act_{act}",
+            "image_hash": uploaded_hash
+            or (
+                str((created_creative or {}).get("image_hash") or "")
+                if created_creative
+                else ""
+            ),
+            "cta": str((created_creative or {}).get("cta") or "")
+            if created_creative
+            else "",
+            "link_url": str((created_creative or {}).get("link_url") or "")
+            if created_creative
+            else "",
+            "creative_created": bool(created_creative),
+            "ads_manager_url": (
+                f"https://www.facebook.com/adsmanager/manage/ads"
+                f"?act={act}&selected_ad_ids={ad_id}"
+            ),
+            "raw": data,
+        }
 
     def update_object_status(
         self, object_id: str, status: str

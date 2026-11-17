@@ -113,6 +113,7 @@ Reload MCP in Cursor settings after starting the server.
 | `get_campaign_budgets` | Campaign budgets + status |
 | `create_campaign` | Create a Meta campaign (`ads_management`; defaults to PAUSED) |
 | `create_adset` | Create a Meta ad set under a campaign (`ads_management`; defaults to PAUSED) |
+| `create_ad` | Create a Meta ad under an ad set (`ads_management`; defaults to PAUSED) |
 | `set_object_status` | Pause / activate campaign, ad set, or ad (`ads_management`) |
 | `get_adset_targeting` | Who each ad set targets |
 | `get_multi_account_spend` | Spend rollup across all accounts |
@@ -132,6 +133,8 @@ Reload MCP in Cursor settings after starting the server.
 - "Campaign budgets and status"
 - "Create a PAUSED Meta campaign named CH_US_TEST with objective OUTCOME_SALES"
 - "Create a PAUSED ad set under campaign 120… targeting US ages 18-65, optimization OFFSITE_CONVERSIONS, daily budget 50"
+- "Create a PAUSED ad named CH_US_TEST_Ad under ad set 120… using creative 120…"
+- "Create a PAUSED ad under ad set 120… with page_id …, link https://…, message …, image_url https://…"
 - "Pause campaign 120…" / "Activate campaign 120…"
 - "Reach and frequency by campaign this month"
 - "Top ads by spend yesterday"
