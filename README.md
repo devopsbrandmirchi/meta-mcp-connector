@@ -111,6 +111,7 @@ Reload MCP in Cursor settings after starting the server.
 | `get_reach_frequency` | Reach & frequency (delivery pressure) |
 | `get_top_ads` | Top ads by spend or other metric |
 | `get_campaign_budgets` | Campaign budgets + status |
+| `create_campaign` | Create a Meta campaign (`ads_management`; defaults to PAUSED) |
 | `set_object_status` | Pause / activate campaign, ad set, or ad (`ads_management`) |
 | `get_adset_targeting` | Who each ad set targets |
 | `get_multi_account_spend` | Spend rollup across all accounts |
@@ -128,6 +129,7 @@ Reload MCP in Cursor settings after starting the server.
 - "Download creative images for these ads so I can put screenshots in a sheet"
 - "Who does the Prospecting ad set target?"
 - "Campaign budgets and status"
+- "Create a PAUSED Meta campaign named CH_US_TEST with objective OUTCOME_SALES"
 - "Pause campaign 120…" / "Activate campaign 120…"
 - "Reach and frequency by campaign this month"
 - "Top ads by spend yesterday"

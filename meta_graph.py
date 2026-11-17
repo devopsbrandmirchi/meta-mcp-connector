@@ -1117,6 +1117,28 @@ class MetaGraphClient:
                 parts.append(f"{label}: " + ", ".join(names))
         return "; ".join(parts) if parts else json.dumps(targeting)[:240]
 
+    # Modern Outcome API objectives (Marketing API).
+    CAMPAIGN_OBJECTIVES = frozenset(
+        {
+            "OUTCOME_AWARENESS",
+            "OUTCOME_ENGAGEMENT",
+            "OUTCOME_LEADS",
+            "OUTCOME_SALES",
+            "OUTCOME_TRAFFIC",
+            "OUTCOME_APP_PROMOTION",
+        }
+    )
+    SPECIAL_AD_CATEGORIES = frozenset(
+        {
+            "NONE",
+            "EMPLOYMENT",
+            "HOUSING",
+            "CREDIT",
+            "ISSUES_ELECTIONS_POLITICS",
+            "FINANCIAL_PRODUCTS_SERVICES",
+        }
+    )
+
     @staticmethod
     def _budget_display(raw: Any) -> str:
         """Meta budgets are in account currency minor units (cents)."""
@@ -1127,6 +1149,118 @@ class MetaGraphClient:
         if cents <= 0:
             return ""
         return f"{cents / 100:,.2f}"
+
+    @staticmethod
+    def _budget_to_cents(amount: Any) -> Optional[int]:
+        """Convert major currency units (e.g. 50.00) to Meta minor units."""
+        if amount is None or amount == "":
+            return None
+        try:
+            major = float(amount)
+        except (TypeError, ValueError) as exc:
+            raise MetaGraphError(
+                f"Budget must be a number in major currency units (e.g. 50.00), got {amount!r}"
+            ) from exc
+        if major <= 0:
+            raise MetaGraphError("Budget must be greater than zero")
+        return int(round(major * 100))
+
+    def create_campaign(
+        self,
+        name: str,
+        objective: str,
+        *,
+        account_id: str = "",
+        status: str = "PAUSED",
+        daily_budget: Any = "",
+        lifetime_budget: Any = "",
+        special_ad_categories: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
+        """
+        Create a Meta campaign (needs ads_management).
+
+        Defaults to PAUSED. special_ad_categories is required by Graph; empty
+        list means no special category.
+        """
+        campaign_name = (name or "").strip()
+        if not campaign_name:
+            raise MetaGraphError("Campaign name is required")
+
+        obj = (objective or "").strip().upper()
+        if obj not in self.CAMPAIGN_OBJECTIVES:
+            allowed = ", ".join(sorted(self.CAMPAIGN_OBJECTIVES))
+            raise MetaGraphError(
+                f"Unknown objective {objective!r}. Use one of: {allowed}"
+            )
+
+        desired = (status or "PAUSED").strip().upper() or "PAUSED"
+        if desired not in ("ACTIVE", "PAUSED"):
+            raise MetaGraphError("status must be ACTIVE or PAUSED")
+        # Safety: never invent ACTIVE when status is blank/garbage — already checked.
+        # Callers should pass PAUSED unless they explicitly want ACTIVE.
+
+        cats_raw = special_ad_categories
+        if cats_raw is None:
+            cats: list[str] = []
+        else:
+            cats = []
+            for c in cats_raw:
+                label = str(c or "").strip().upper()
+                if not label or label == "NONE":
+                    continue
+                if label not in self.SPECIAL_AD_CATEGORIES:
+                    allowed = ", ".join(sorted(self.SPECIAL_AD_CATEGORIES))
+                    raise MetaGraphError(
+                        f"Unknown special_ad_category {c!r}. Use none or: {allowed}"
+                    )
+                if label not in cats:
+                    cats.append(label)
+
+        daily_cents = self._budget_to_cents(daily_budget) if daily_budget not in ("", None) else None
+        lifetime_cents = (
+            self._budget_to_cents(lifetime_budget)
+            if lifetime_budget not in ("", None)
+            else None
+        )
+        if daily_cents is not None and lifetime_cents is not None:
+            raise MetaGraphError(
+                "Pass only one of daily_budget or lifetime_budget, not both"
+            )
+
+        act = self.resolve_account_id(account_id)
+        params: dict[str, Any] = {
+            "name": campaign_name,
+            "objective": obj,
+            "status": desired,
+            "special_ad_categories": json.dumps(cats, separators=(",", ":")),
+        }
+        if daily_cents is not None:
+            params["daily_budget"] = daily_cents
+        if lifetime_cents is not None:
+            params["lifetime_budget"] = lifetime_cents
+
+        data = self._graph_post(f"act_{act}/campaigns", params)
+        campaign_id = str(data.get("id") or "").strip()
+        if not campaign_id:
+            raise MetaGraphError(f"Campaign create returned no id: {data}")
+
+        return {
+            "campaign_id": campaign_id,
+            "campaign_name": campaign_name,
+            "status": desired,
+            "objective": obj,
+            "account_id": f"act_{act}",
+            "daily_budget": self._budget_display(daily_cents) if daily_cents else "",
+            "lifetime_budget": (
+                self._budget_display(lifetime_cents) if lifetime_cents else ""
+            ),
+            "special_ad_categories": cats,
+            "ads_manager_url": (
+                f"https://www.facebook.com/adsmanager/manage/campaigns"
+                f"?act={act}&selected_campaign_ids={campaign_id}"
+            ),
+            "raw": data,
+        }
 
     def list_campaign_budgets(
         self, account_id: str = "", search: str = "", limit: int = 50

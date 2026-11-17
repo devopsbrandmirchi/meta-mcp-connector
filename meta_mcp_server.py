@@ -462,6 +462,7 @@ CAMPAIGNS, AD SETS & CREATIVES
 - "Download creative images for these ads so I can put screenshots in a sheet"
 - "Who does this ad set target?"
 - "Campaign budgets and status"
+- "Create a PAUSED Meta campaign named CH_US_TEST with objective OUTCOME_SALES"
 - "Pause campaign X" / "Activate campaign X" (needs ads_management)
 
 PERFORMANCE (live from Facebook Graph API)
@@ -1356,6 +1357,75 @@ def get_campaign_budgets(
 
 
 @mcp.tool()
+def create_campaign(
+    name: str,
+    objective: str,
+    account_id: str = "",
+    status: str = "PAUSED",
+    daily_budget: str = "",
+    lifetime_budget: str = "",
+    special_ad_categories: str = "",
+) -> str:
+    """
+    Create a Meta campaign (ads_management). Defaults to PAUSED — no spend until activated.
+
+    objective must be an Outcome API value, e.g. OUTCOME_SALES, OUTCOME_TRAFFIC,
+    OUTCOME_LEADS, OUTCOME_AWARENESS, OUTCOME_ENGAGEMENT, OUTCOME_APP_PROMOTION.
+    Budgets are major currency units (e.g. 50.00). special_ad_categories is a
+    comma-separated list (HOUSING, CREDIT, …) or blank for none.
+    Creating a campaign does not create an ad set or ad — those come in later tools.
+    """
+    cats = [
+        part.strip()
+        for part in (special_ad_categories or "").replace(";", ",").split(",")
+        if part.strip()
+    ]
+    desired = (status or "PAUSED").strip().upper() or "PAUSED"
+    try:
+        row = _fb().create_campaign(
+            name,
+            objective,
+            account_id=account_id,
+            status=desired,
+            daily_budget=daily_budget,
+            lifetime_budget=lifetime_budget,
+            special_ad_categories=cats or None,
+        )
+    except MetaGraphError as e:
+        return (
+            f"Failed to create campaign: {e}\n"
+            "Ensure FACEBOOK_ACCESS_TOKEN has ads_management and the account allows creates."
+        )
+
+    lines = [
+        "Meta campaign created (Graph API)",
+        f"Campaign ID: {row.get('campaign_id')}",
+        f"Name: {row.get('campaign_name')}",
+        f"Status: {row.get('status')}",
+        f"Objective: {row.get('objective')}",
+        f"Account: {row.get('account_id')}",
+    ]
+    if row.get("daily_budget"):
+        lines.append(f"Daily budget: {row.get('daily_budget')}")
+    if row.get("lifetime_budget"):
+        lines.append(f"Lifetime budget: {row.get('lifetime_budget')}")
+    cats_out = row.get("special_ad_categories") or []
+    lines.append(
+        "Special ad categories: "
+        + (", ".join(cats_out) if cats_out else "(none)")
+    )
+    lines.append(f"Ads Manager: {row.get('ads_manager_url')}")
+    lines.append(
+        "Note: campaign is PAUSED by default and has no ad set/ad yet — "
+        "it cannot deliver until those exist and status is ACTIVE "
+        "(use set_object_status to activate)."
+        if (row.get("status") or "").upper() == "PAUSED"
+        else "Note: campaign is ACTIVE but still needs an ad set and ad before it can deliver."
+    )
+    return "\n".join(lines)
+
+
+@mcp.tool()
 def set_object_status(
     object_id: str,
     status: str,
@@ -1848,6 +1918,7 @@ if __name__ == "__main__":
         "get_reach_frequency",
         "get_top_ads",
         "get_campaign_budgets",
+        "create_campaign",
         "set_object_status",
         "get_adset_targeting",
         "get_multi_account_spend",
