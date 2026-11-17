@@ -114,7 +114,11 @@ Reload MCP in Cursor settings after starting the server.
 | `create_campaign` | Create a Meta campaign (`ads_management`; defaults to PAUSED) |
 | `create_adset` | Create a Meta ad set under a campaign (`ads_management`; defaults to PAUSED) |
 | `create_ad` | Create a Meta ad under an ad set (`ads_management`; defaults to PAUSED) |
-| `set_object_status` | Pause / activate campaign, ad set, or ad (`ads_management`) |
+| `upload_ad_image` | Upload local image bytes (base64) → Meta `image_hash` |
+| `update_campaign` | Edit campaign name / budget (no delete; objective not editable) |
+| `update_adset` | Edit ad set name / budget / targeting / schedule |
+| `update_ad` | Edit ad name or swap/create creative |
+| `set_object_status` | Pause / activate campaign, ad set, or ad (`ads_management`; no delete) |
 | `get_adset_targeting` | Who each ad set targets |
 | `get_multi_account_spend` | Spend rollup across all accounts |
 
@@ -135,7 +139,12 @@ Reload MCP in Cursor settings after starting the server.
 - "Create a PAUSED ad set under campaign 120… targeting US ages 18-65, optimization OFFSITE_CONVERSIONS, daily budget 50"
 - "Create a PAUSED ad named CH_US_TEST_Ad under ad set 120… using creative 120…"
 - "Create a PAUSED ad under ad set 120… with page_id …, link https://…, message …, image_url https://…"
+- "Upload this local image as base64 to the Meta ad account"
+- "Update campaign 120… daily budget to 75"
+- "Update ad set 120… targeting US ages 25-54"
+- "Update ad 120… with a new creative image"
 - "Pause campaign 120…" / "Activate campaign 120…"
+- Delete / archive via the connector is intentionally unsupported
 - "Reach and frequency by campaign this month"
 - "Top ads by spend yesterday"
 - "Break down spend by campaign last week"

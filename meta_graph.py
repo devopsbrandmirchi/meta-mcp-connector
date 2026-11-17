@@ -363,6 +363,30 @@ class MetaGraphClient:
             raise MetaGraphError(f"Graph API HTTP {res.status_code}: {data}")
         return data
 
+    def _graph_post_multipart(
+        self,
+        path: str,
+        *,
+        data: Optional[dict[str, Any]] = None,
+        files: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """POST with multipart form (used for local/base64 ad image upload)."""
+        clean_path = path.split("?", 1)[0].lstrip("/")
+        form = dict(data or {})
+        if "access_token" not in form:
+            form["access_token"] = self.access_token()
+        url = f"{FB_BASE}/{clean_path}"
+        logger.info("Graph POST multipart %s", self._safe_log_url(url, form))
+        with httpx.Client(timeout=180.0) as client:
+            res = client.post(url, data=form, files=files or None)
+            payload = res.json() if res.content else {}
+        if not res.is_success:
+            err = payload.get("error")
+            if isinstance(err, dict):
+                raise MetaGraphError(f"Graph API error: {err.get('message') or err}")
+            raise MetaGraphError(f"Graph API HTTP {res.status_code}: {payload}")
+        return payload
+
     def _paginate(
         self, path: str, params: Optional[dict[str, Any]] = None, *, max_pages: int = 50
     ) -> list[dict[str, Any]]:
@@ -1524,6 +1548,34 @@ class MetaGraphClient:
             )
         return out
 
+    @staticmethod
+    def _parse_adimages_response(
+        data: dict[str, Any], *, account_id: str, fallback_url: str = ""
+    ) -> dict[str, Any]:
+        images = data.get("images")
+        if isinstance(images, dict) and images:
+            first = next(iter(images.values()))
+            if isinstance(first, dict):
+                image_hash = str(first.get("hash") or "").strip()
+                if image_hash:
+                    return {
+                        "image_hash": image_hash,
+                        "url": str(first.get("url") or fallback_url),
+                        "name": str(first.get("name") or ""),
+                        "account_id": f"act_{account_id}",
+                        "raw": data,
+                    }
+        image_hash = str(data.get("hash") or "").strip()
+        if image_hash:
+            return {
+                "image_hash": image_hash,
+                "url": fallback_url,
+                "name": "",
+                "account_id": f"act_{account_id}",
+                "raw": data,
+            }
+        raise MetaGraphError(f"adimages upload returned no hash: {data}")
+
     def upload_ad_image_from_url(
         self, image_url: str, *, account_id: str = ""
     ) -> dict[str, Any]:
@@ -1535,31 +1587,104 @@ class MetaGraphClient:
             raise MetaGraphError("image_url must be an http(s) URL")
         act = self.resolve_account_id(account_id)
         data = self._graph_post(f"act_{act}/adimages", {"url": url})
-        images = data.get("images")
-        if isinstance(images, dict) and images:
-            # Response is {hash: {hash, url, ...}, ...}
-            first = next(iter(images.values()))
-            if isinstance(first, dict):
-                image_hash = str(first.get("hash") or "").strip()
-                if image_hash:
-                    return {
-                        "image_hash": image_hash,
-                        "url": str(first.get("url") or url),
-                        "name": str(first.get("name") or ""),
-                        "account_id": f"act_{act}",
-                        "raw": data,
-                    }
-        # Some API versions return hash at top level
-        image_hash = str(data.get("hash") or "").strip()
-        if image_hash:
-            return {
-                "image_hash": image_hash,
-                "url": url,
-                "name": "",
-                "account_id": f"act_{act}",
-                "raw": data,
-            }
-        raise MetaGraphError(f"adimages upload returned no hash: {data}")
+        return self._parse_adimages_response(data, account_id=act, fallback_url=url)
+
+    def upload_ad_image_bytes(
+        self,
+        image_bytes: bytes,
+        *,
+        account_id: str = "",
+        mime_type: str = "image/jpeg",
+        filename: str = "",
+    ) -> dict[str, Any]:
+        """Upload raw image bytes (from Claude base64) into the ad account library."""
+        content = image_bytes or b""
+        if not content:
+            raise MetaGraphError("image bytes are empty")
+        if len(content) > CREATIVE_IMAGE_MAX_BYTES:
+            raise MetaGraphError(
+                f"Image exceeds {CREATIVE_IMAGE_MAX_BYTES} bytes ({len(content)} bytes)"
+            )
+        mime = (mime_type or "image/jpeg").split(";")[0].strip().lower() or "image/jpeg"
+        if not mime.startswith("image/"):
+            raise MetaGraphError(f"mime_type must be an image/* type, got {mime_type!r}")
+        ext = {
+            "image/jpeg": ".jpg",
+            "image/jpg": ".jpg",
+            "image/png": ".png",
+            "image/gif": ".gif",
+            "image/webp": ".webp",
+        }.get(mime, ".jpg")
+        fname = (filename or "").strip() or f"upload{ext}"
+        if "." not in fname:
+            fname = f"{fname}{ext}"
+        act = self.resolve_account_id(account_id)
+        # Meta adimages multipart field name is "filename".
+        data = self._graph_post_multipart(
+            f"act_{act}/adimages",
+            files={"filename": (fname, content, mime)},
+        )
+        return self._parse_adimages_response(data, account_id=act)
+
+    def upload_ad_image_base64(
+        self,
+        image_base64: str,
+        *,
+        account_id: str = "",
+        mime_type: str = "image/jpeg",
+        filename: str = "",
+    ) -> dict[str, Any]:
+        """Decode base64 (data-URL tolerant) and upload via multipart."""
+        raw = (image_base64 or "").strip()
+        if not raw:
+            raise MetaGraphError("image_base64 is required")
+        mime = (mime_type or "image/jpeg").strip()
+        if raw.startswith("data:") and "," in raw:
+            header, raw = raw.split(",", 1)
+            # data:image/png;base64,...
+            if ";base64" in header and header.startswith("data:"):
+                declared = header[5:].split(";", 1)[0].strip()
+                if declared:
+                    mime = declared
+        try:
+            content = base64.b64decode(raw, validate=False)
+        except Exception as exc:  # noqa: BLE001
+            raise MetaGraphError(f"image_base64 is not valid base64: {exc}") from exc
+        return self.upload_ad_image_bytes(
+            content,
+            account_id=account_id,
+            mime_type=mime,
+            filename=filename,
+        )
+
+    def _resolve_image_hash(
+        self,
+        *,
+        account_id: str,
+        image_hash: str = "",
+        image_base64: str = "",
+        image_url: str = "",
+        image_mime: str = "image/jpeg",
+        image_filename: str = "",
+    ) -> str:
+        """Priority: image_hash > image_base64 > image_url."""
+        existing = (image_hash or "").strip()
+        if existing:
+            return existing
+        if (image_base64 or "").strip():
+            uploaded = self.upload_ad_image_base64(
+                image_base64,
+                account_id=account_id,
+                mime_type=image_mime,
+                filename=image_filename,
+            )
+            return str(uploaded.get("image_hash") or "")
+        if (image_url or "").strip():
+            uploaded = self.upload_ad_image_from_url(
+                image_url, account_id=account_id
+            )
+            return str(uploaded.get("image_hash") or "")
+        return ""
 
     def create_ad_creative(
         self,
@@ -1643,7 +1768,10 @@ class MetaGraphClient:
         link_url: str = "",
         message: str = "",
         image_hash: str = "",
+        image_base64: str = "",
         image_url: str = "",
+        image_mime: str = "image/jpeg",
+        image_filename: str = "",
         headline: str = "",
         description: str = "",
         cta: str = "LEARN_MORE",
@@ -1653,8 +1781,9 @@ class MetaGraphClient:
         Create a Meta ad under an existing ad set (needs ads_management).
 
         Path A: pass creative_id to reuse an existing creative.
-        Path B: pass page_id + link_url + message + image_hash or image_url.
-        creative_id wins when both are provided. Defaults to PAUSED.
+        Path B: page_id + link_url + message + image_hash / image_base64 / image_url.
+        Image priority: image_hash > image_base64 > image_url.
+        creative_id wins when both paths are provided. Defaults to PAUSED.
         """
         ad_name = (name or "").strip()
         if not ad_name:
@@ -1673,12 +1802,15 @@ class MetaGraphClient:
         created_creative: Optional[dict[str, Any]] = None
 
         if not cid:
-            img_hash = (image_hash or "").strip()
-            img_url = (image_url or "").strip()
-            if not img_hash and img_url:
-                uploaded = self.upload_ad_image_from_url(img_url, account_id=act)
-                img_hash = str(uploaded.get("image_hash") or "")
-                uploaded_hash = img_hash
+            img_hash = self._resolve_image_hash(
+                account_id=act,
+                image_hash=image_hash,
+                image_base64=image_base64,
+                image_url=image_url,
+                image_mime=image_mime,
+                image_filename=image_filename,
+            )
+            uploaded_hash = img_hash
             if not (
                 (page_id or "").strip()
                 and (link_url or "").strip()
@@ -1687,7 +1819,7 @@ class MetaGraphClient:
             ):
                 raise MetaGraphError(
                     "Pass creative_id, or page_id + link_url + message + "
-                    "image_hash (or image_url) to create a link creative."
+                    "image_hash (or image_base64 / image_url) to create a link creative."
                 )
             created_creative = self.create_ad_creative(
                 page_id=page_id,
@@ -1701,8 +1833,6 @@ class MetaGraphClient:
                 cta=cta,
             )
             cid = str(created_creative.get("creative_id") or "")
-            if not uploaded_hash:
-                uploaded_hash = img_hash
 
         if not cid:
             raise MetaGraphError("creative_id could not be resolved")
@@ -1742,6 +1872,292 @@ class MetaGraphClient:
                 f"https://www.facebook.com/adsmanager/manage/ads"
                 f"?act={act}&selected_ad_ids={ad_id}"
             ),
+            "raw": data,
+        }
+
+    def update_campaign(
+        self,
+        campaign_id: str,
+        *,
+        name: str = "",
+        daily_budget: Any = "",
+        lifetime_budget: Any = "",
+    ) -> dict[str, Any]:
+        """Partial update for an existing campaign (name / budget). No delete."""
+        oid = (campaign_id or "").strip()
+        if not oid:
+            raise MetaGraphError("campaign_id is required")
+        params: dict[str, Any] = {}
+        new_name = (name or "").strip()
+        if new_name:
+            params["name"] = new_name
+        daily_cents = (
+            self._budget_to_cents(daily_budget)
+            if daily_budget not in ("", None)
+            else None
+        )
+        lifetime_cents = (
+            self._budget_to_cents(lifetime_budget)
+            if lifetime_budget not in ("", None)
+            else None
+        )
+        if daily_cents is not None and lifetime_cents is not None:
+            raise MetaGraphError(
+                "Pass only one of daily_budget or lifetime_budget, not both"
+            )
+        if daily_cents is not None:
+            params["daily_budget"] = daily_cents
+        if lifetime_cents is not None:
+            params["lifetime_budget"] = lifetime_cents
+        if not params:
+            raise MetaGraphError(
+                "Nothing to update. Pass name and/or daily_budget or lifetime_budget."
+            )
+        data = self._graph_post(oid, params)
+        return {
+            "campaign_id": oid,
+            "updated_fields": sorted(params.keys()),
+            "daily_budget": self._budget_display(daily_cents) if daily_cents else "",
+            "lifetime_budget": (
+                self._budget_display(lifetime_cents) if lifetime_cents else ""
+            ),
+            "name": new_name,
+            "success": data.get("success", True),
+            "raw": data,
+        }
+
+    def update_adset(
+        self,
+        adset_id: str,
+        *,
+        name: str = "",
+        daily_budget: Any = "",
+        lifetime_budget: Any = "",
+        start_time: str = "",
+        end_time: str = "",
+        countries: str = "",
+        age_min: Any = "",
+        age_max: Any = "",
+        genders: str = "",
+        targeting_json: str = "",
+        optimization_goal: str = "",
+        billing_event: str = "",
+    ) -> dict[str, Any]:
+        """Partial update for an existing ad set. No delete."""
+        oid = (adset_id or "").strip()
+        if not oid:
+            raise MetaGraphError("adset_id is required")
+        params: dict[str, Any] = {}
+        new_name = (name or "").strip()
+        if new_name:
+            params["name"] = new_name
+
+        daily_cents = (
+            self._budget_to_cents(daily_budget)
+            if daily_budget not in ("", None)
+            else None
+        )
+        lifetime_cents = (
+            self._budget_to_cents(lifetime_budget)
+            if lifetime_budget not in ("", None)
+            else None
+        )
+        if daily_cents is not None and lifetime_cents is not None:
+            raise MetaGraphError(
+                "Pass only one of daily_budget or lifetime_budget, not both"
+            )
+        if daily_cents is not None:
+            params["daily_budget"] = daily_cents
+        if lifetime_cents is not None:
+            params["lifetime_budget"] = lifetime_cents
+
+        start = (start_time or "").strip()
+        if start:
+            params["start_time"] = start
+        end = (end_time or "").strip()
+        if end:
+            params["end_time"] = end
+
+        goal = (optimization_goal or "").strip().upper()
+        if goal:
+            if goal not in self.ADSET_OPTIMIZATION_GOALS:
+                allowed = ", ".join(sorted(self.ADSET_OPTIMIZATION_GOALS))
+                raise MetaGraphError(
+                    f"Unknown optimization_goal {optimization_goal!r}. Use one of: {allowed}"
+                )
+            params["optimization_goal"] = goal
+        billing = (billing_event or "").strip().upper()
+        if billing:
+            if billing not in self.ADSET_BILLING_EVENTS:
+                allowed = ", ".join(sorted(self.ADSET_BILLING_EVENTS))
+                raise MetaGraphError(
+                    f"Unknown billing_event {billing_event!r}. Use one of: {allowed}"
+                )
+            params["billing_event"] = billing
+
+        targeting: Optional[dict[str, Any]] = None
+        raw_targeting = (targeting_json or "").strip()
+        if raw_targeting:
+            try:
+                targeting = json.loads(raw_targeting)
+            except json.JSONDecodeError as exc:
+                raise MetaGraphError(
+                    f"targeting_json must be valid JSON: {exc}"
+                ) from exc
+            if not isinstance(targeting, dict):
+                raise MetaGraphError("targeting_json must be a JSON object")
+        elif any(
+            str(v).strip()
+            for v in (countries, genders)
+        ) or age_min not in ("", None) or age_max not in ("", None):
+            targeting = self.build_simple_targeting(
+                countries=countries or "US",
+                age_min=age_min if age_min not in ("", None) else 18,
+                age_max=age_max if age_max not in ("", None) else 65,
+                genders=genders,
+            )
+        if targeting is not None:
+            params["targeting"] = json.dumps(targeting, separators=(",", ":"))
+
+        if not params:
+            raise MetaGraphError(
+                "Nothing to update. Pass name, budget, schedule, targeting, "
+                "optimization_goal, and/or billing_event."
+            )
+        data = self._graph_post(oid, params)
+        return {
+            "adset_id": oid,
+            "updated_fields": sorted(
+                k for k in params.keys() if k != "targeting"
+            )
+            + (["targeting"] if "targeting" in params else []),
+            "name": new_name,
+            "daily_budget": self._budget_display(daily_cents) if daily_cents else "",
+            "lifetime_budget": (
+                self._budget_display(lifetime_cents) if lifetime_cents else ""
+            ),
+            "targeting_summary": (
+                self._summarize_targeting(targeting) if targeting else ""
+            ),
+            "success": data.get("success", True),
+            "raw": data,
+        }
+
+    def update_ad(
+        self,
+        ad_id: str,
+        *,
+        account_id: str = "",
+        name: str = "",
+        creative_id: str = "",
+        page_id: str = "",
+        link_url: str = "",
+        message: str = "",
+        image_hash: str = "",
+        image_base64: str = "",
+        image_url: str = "",
+        image_mime: str = "image/jpeg",
+        image_filename: str = "",
+        headline: str = "",
+        description: str = "",
+        cta: str = "LEARN_MORE",
+        creative_name: str = "",
+    ) -> dict[str, Any]:
+        """
+        Partial update for an existing ad (name and/or creative swap).
+
+        Creative swap: pass creative_id, or Path B fields to create a new link
+        creative and attach it. Does not delete the old creative.
+        """
+        oid = (ad_id or "").strip()
+        if not oid:
+            raise MetaGraphError("ad_id is required")
+        params: dict[str, Any] = {}
+        new_name = (name or "").strip()
+        if new_name:
+            params["name"] = new_name
+
+        act = self.resolve_account_id(account_id) if (
+            (creative_id or "").strip()
+            or (page_id or "").strip()
+            or (image_hash or "").strip()
+            or (image_base64 or "").strip()
+            or (image_url or "").strip()
+        ) else ""
+
+        cid = (creative_id or "").strip()
+        created_creative: Optional[dict[str, Any]] = None
+        uploaded_hash = ""
+        if not cid and (
+            (page_id or "").strip()
+            or (link_url or "").strip()
+            or (message or "").strip()
+            or (image_hash or "").strip()
+            or (image_base64 or "").strip()
+            or (image_url or "").strip()
+        ):
+            if not act:
+                act = self.resolve_account_id(account_id)
+            img_hash = self._resolve_image_hash(
+                account_id=act,
+                image_hash=image_hash,
+                image_base64=image_base64,
+                image_url=image_url,
+                image_mime=image_mime,
+                image_filename=image_filename,
+            )
+            uploaded_hash = img_hash
+            if not (
+                (page_id or "").strip()
+                and (link_url or "").strip()
+                and (message or "").strip()
+                and img_hash
+            ):
+                raise MetaGraphError(
+                    "To create a new creative for update_ad, pass page_id + "
+                    "link_url + message + image_hash (or image_base64 / image_url)."
+                )
+            created_creative = self.create_ad_creative(
+                page_id=page_id,
+                link_url=link_url,
+                message=message,
+                image_hash=img_hash,
+                account_id=act,
+                name=(creative_name or "").strip() or new_name or f"Creative {oid}",
+                headline=headline,
+                description=description,
+                cta=cta,
+            )
+            cid = str(created_creative.get("creative_id") or "")
+
+        if cid:
+            params["creative"] = json.dumps(
+                {"creative_id": cid}, separators=(",", ":")
+            )
+
+        if not params:
+            raise MetaGraphError(
+                "Nothing to update. Pass name and/or creative_id / link-creative fields."
+            )
+        data = self._graph_post(oid, params)
+        updated = []
+        if "name" in params:
+            updated.append("name")
+        if "creative" in params:
+            updated.append("creative")
+        return {
+            "ad_id": oid,
+            "updated_fields": updated,
+            "name": new_name,
+            "creative_id": cid,
+            "creative_created": bool(created_creative),
+            "image_hash": uploaded_hash
+            or (
+                str((created_creative or {}).get("image_hash") or "")
+                if created_creative
+                else ""
+            ),
+            "success": data.get("success", True),
             "raw": data,
         }
 

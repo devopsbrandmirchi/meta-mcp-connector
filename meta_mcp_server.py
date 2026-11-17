@@ -465,7 +465,12 @@ CAMPAIGNS, AD SETS & CREATIVES
 - "Create a PAUSED Meta campaign named CH_US_TEST with objective OUTCOME_SALES"
 - "Create a PAUSED ad set under campaign 120… targeting US ages 18-65"
 - "Create a PAUSED ad under ad set 120… using creative 120…"
+- "Upload this local image (base64) to the Meta ad account"
+- "Update campaign 120… daily budget to 75"
+- "Update ad set 120… targeting to US ages 25-54"
+- "Update ad 120… with a new creative / image"
 - "Pause campaign X" / "Activate campaign X" (needs ads_management)
+- Delete is not supported — use Ads Manager if you must remove objects
 
 PERFORMANCE (live from Facebook Graph API)
 - "Meta ads summary from 2026-08-01 to 2026-08-15"
@@ -1525,7 +1530,10 @@ def create_ad(
     link_url: str = "",
     message: str = "",
     image_hash: str = "",
+    image_base64: str = "",
     image_url: str = "",
+    image_mime: str = "image/jpeg",
+    image_filename: str = "",
     headline: str = "",
     description: str = "",
     cta: str = "LEARN_MORE",
@@ -1535,8 +1543,9 @@ def create_ad(
     Create a Meta ad under an existing ad set (ads_management). Defaults to PAUSED.
 
     Path A: pass creative_id to reuse an existing creative (wins if also Path B fields).
-    Path B: page_id + link_url + message + image_hash or public image_url (uploads first).
-    Optional headline, description, cta (default LEARN_MORE). Link/image ads only.
+    Path B: page_id + link_url + message + image_hash / image_base64 / public image_url.
+    Image priority: image_hash > image_base64 > image_url. Optional headline, description,
+    cta (default LEARN_MORE). Link/image ads only. Delete is not supported.
     """
     desired = (status or "PAUSED").strip().upper() or "PAUSED"
     try:
@@ -1550,7 +1559,10 @@ def create_ad(
             link_url=link_url,
             message=message,
             image_hash=image_hash,
+            image_base64=image_base64,
             image_url=image_url,
+            image_mime=image_mime,
+            image_filename=image_filename,
             headline=headline,
             description=description,
             cta=cta,
@@ -1561,7 +1573,7 @@ def create_ad(
             f"Failed to create ad: {e}\n"
             "Ensure FACEBOOK_ACCESS_TOKEN has ads_management, adset_id is valid, "
             "and either creative_id or page_id+link_url+message+image are set. "
-            "image_url must be publicly reachable by Meta."
+            "For local files pass image_base64; for remote files use a public image_url."
         )
 
     lines = [
@@ -1594,6 +1606,204 @@ def create_ad(
 
 
 @mcp.tool()
+def upload_ad_image(
+    image_base64: str,
+    account_id: str = "",
+    mime_type: str = "image/jpeg",
+    filename: str = "",
+) -> str:
+    """
+    Upload a local image (base64) into the Meta ad account library and return image_hash.
+
+    Claude should read the user's file and pass bytes as image_base64 (data-URL ok).
+    Use the returned image_hash with create_ad / update_ad. Max size ~5 MB. No delete.
+    """
+    try:
+        row = _fb().upload_ad_image_base64(
+            image_base64,
+            account_id=account_id,
+            mime_type=mime_type,
+            filename=filename,
+        )
+    except MetaGraphError as e:
+        return (
+            f"Failed to upload image: {e}\n"
+            "Pass valid image_base64 (and mime_type). "
+            "Ensure FACEBOOK_ACCESS_TOKEN has ads_management."
+        )
+    return "\n".join(
+        [
+            "Meta ad image uploaded (Graph API)",
+            f"Image hash: {row.get('image_hash')}",
+            f"Account: {row.get('account_id')}",
+            f"Name: {row.get('name') or '—'}",
+            f"URL: {row.get('url') or '—'}",
+            "Use this image_hash with create_ad or update_ad. Delete is not supported.",
+        ]
+    )
+
+
+@mcp.tool()
+def update_campaign(
+    campaign_id: str,
+    name: str = "",
+    daily_budget: str = "",
+    lifetime_budget: str = "",
+) -> str:
+    """
+    Update an existing Meta campaign (name and/or budget). Blank fields are left unchanged.
+
+    Does not change objective. Does not delete. Budgets are major currency units (e.g. 75.00).
+    """
+    try:
+        row = _fb().update_campaign(
+            campaign_id,
+            name=name,
+            daily_budget=daily_budget,
+            lifetime_budget=lifetime_budget,
+        )
+    except MetaGraphError as e:
+        return f"Failed to update campaign: {e}"
+    lines = [
+        "Meta campaign updated (Graph API)",
+        f"Campaign ID: {row.get('campaign_id')}",
+        f"Fields: {', '.join(row.get('updated_fields') or [])}",
+    ]
+    if row.get("name"):
+        lines.append(f"Name: {row.get('name')}")
+    if row.get("daily_budget"):
+        lines.append(f"Daily budget: {row.get('daily_budget')}")
+    if row.get("lifetime_budget"):
+        lines.append(f"Lifetime budget: {row.get('lifetime_budget')}")
+    lines.append("Delete is not supported via this connector.")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def update_adset(
+    adset_id: str,
+    name: str = "",
+    daily_budget: str = "",
+    lifetime_budget: str = "",
+    start_time: str = "",
+    end_time: str = "",
+    countries: str = "",
+    age_min: str = "",
+    age_max: str = "",
+    genders: str = "",
+    targeting_json: str = "",
+    optimization_goal: str = "",
+    billing_event: str = "",
+) -> str:
+    """
+    Update an existing Meta ad set (name, budget, schedule, targeting, goals).
+
+    Blank fields unchanged. targeting_json wins over simple countries/age/genders.
+    Does not delete. Graph may reject some mid-flight optimization changes.
+    """
+    try:
+        row = _fb().update_adset(
+            adset_id,
+            name=name,
+            daily_budget=daily_budget,
+            lifetime_budget=lifetime_budget,
+            start_time=start_time,
+            end_time=end_time,
+            countries=countries,
+            age_min=age_min,
+            age_max=age_max,
+            genders=genders,
+            targeting_json=targeting_json,
+            optimization_goal=optimization_goal,
+            billing_event=billing_event,
+        )
+    except MetaGraphError as e:
+        return f"Failed to update ad set: {e}"
+    lines = [
+        "Meta ad set updated (Graph API)",
+        f"Ad set ID: {row.get('adset_id')}",
+        f"Fields: {', '.join(row.get('updated_fields') or [])}",
+    ]
+    if row.get("name"):
+        lines.append(f"Name: {row.get('name')}")
+    if row.get("daily_budget"):
+        lines.append(f"Daily budget: {row.get('daily_budget')}")
+    if row.get("lifetime_budget"):
+        lines.append(f"Lifetime budget: {row.get('lifetime_budget')}")
+    if row.get("targeting_summary"):
+        lines.append(f"Targeting: {row.get('targeting_summary')}")
+    lines.append("Delete is not supported via this connector.")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def update_ad(
+    ad_id: str,
+    account_id: str = "",
+    name: str = "",
+    creative_id: str = "",
+    page_id: str = "",
+    link_url: str = "",
+    message: str = "",
+    image_hash: str = "",
+    image_base64: str = "",
+    image_url: str = "",
+    image_mime: str = "image/jpeg",
+    image_filename: str = "",
+    headline: str = "",
+    description: str = "",
+    cta: str = "LEARN_MORE",
+    creative_name: str = "",
+) -> str:
+    """
+    Update an existing Meta ad (name and/or creative). Does not delete the old creative.
+
+    Pass creative_id to swap, or Path B link-creative fields (page_id + link_url +
+    message + image_hash / image_base64 / image_url) to create and attach a new creative.
+    Status changes use set_object_status.
+    """
+    try:
+        row = _fb().update_ad(
+            ad_id,
+            account_id=account_id,
+            name=name,
+            creative_id=creative_id,
+            page_id=page_id,
+            link_url=link_url,
+            message=message,
+            image_hash=image_hash,
+            image_base64=image_base64,
+            image_url=image_url,
+            image_mime=image_mime,
+            image_filename=image_filename,
+            headline=headline,
+            description=description,
+            cta=cta,
+            creative_name=creative_name,
+        )
+    except MetaGraphError as e:
+        return f"Failed to update ad: {e}"
+    lines = [
+        "Meta ad updated (Graph API)",
+        f"Ad ID: {row.get('ad_id')}",
+        f"Fields: {', '.join(row.get('updated_fields') or [])}",
+    ]
+    if row.get("name"):
+        lines.append(f"Name: {row.get('name')}")
+    if row.get("creative_id"):
+        lines.append(f"Creative ID: {row.get('creative_id')}")
+        lines.append(
+            "Creative: newly created link creative"
+            if row.get("creative_created")
+            else "Creative: attached existing creative_id"
+        )
+    if row.get("image_hash"):
+        lines.append(f"Image hash: {row.get('image_hash')}")
+    lines.append("Delete is not supported via this connector.")
+    return "\n".join(lines)
+
+
+@mcp.tool()
 def set_object_status(
     object_id: str,
     status: str,
@@ -1603,13 +1813,14 @@ def set_object_status(
 
     Requires FACEBOOK_ACCESS_TOKEN with ads_management.
     status must be ACTIVE or PAUSED. Pass the Graph object id (campaign/adset/ad).
+    Does not delete or archive objects.
     """
     desired = (status or "").strip().upper()
     oid = (object_id or "").strip()
     if not oid:
         return "object_id is required (campaign, ad set, or ad id)."
     if desired not in ("ACTIVE", "PAUSED"):
-        return "status must be ACTIVE or PAUSED."
+        return "status must be ACTIVE or PAUSED. Delete/ARCHIVE is not supported."
     try:
         result = _fb().update_object_status(oid, desired)
     except MetaGraphError as e:
@@ -2089,6 +2300,10 @@ if __name__ == "__main__":
         "create_campaign",
         "create_adset",
         "create_ad",
+        "upload_ad_image",
+        "update_campaign",
+        "update_adset",
+        "update_ad",
         "set_object_status",
         "get_adset_targeting",
         "get_multi_account_spend",
