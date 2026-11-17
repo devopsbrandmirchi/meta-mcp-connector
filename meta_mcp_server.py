@@ -463,6 +463,7 @@ CAMPAIGNS, AD SETS & CREATIVES
 - "Who does this ad set target?"
 - "Campaign budgets and status"
 - "Create a PAUSED Meta campaign named CH_US_TEST with objective OUTCOME_SALES"
+- "Create a PAUSED ad set under campaign 120… targeting US ages 18-65"
 - "Pause campaign X" / "Activate campaign X" (needs ads_management)
 
 PERFORMANCE (live from Facebook Graph API)
@@ -1426,6 +1427,93 @@ def create_campaign(
 
 
 @mcp.tool()
+def create_adset(
+    name: str,
+    campaign_id: str,
+    optimization_goal: str,
+    account_id: str = "",
+    status: str = "PAUSED",
+    billing_event: str = "IMPRESSIONS",
+    daily_budget: str = "",
+    lifetime_budget: str = "",
+    countries: str = "US",
+    age_min: str = "18",
+    age_max: str = "65",
+    genders: str = "",
+    targeting_json: str = "",
+    promoted_object_json: str = "",
+    start_time: str = "",
+    end_time: str = "",
+) -> str:
+    """
+    Create a Meta ad set under an existing campaign (ads_management). Defaults to PAUSED.
+
+    Simple targeting: countries (comma ISO codes, default US), age_min/age_max, genders
+    (1=men, 2=women). Or pass full Meta targeting as targeting_json (wins if set).
+    For conversion goals, pass promoted_object_json e.g.
+    {"pixel_id":"…","custom_event_type":"PURCHASE"}.
+    Budgets are major currency units. Creating an ad set does not create an ad.
+    """
+    desired = (status or "PAUSED").strip().upper() or "PAUSED"
+    try:
+        row = _fb().create_adset(
+            name,
+            campaign_id,
+            optimization_goal,
+            account_id=account_id,
+            status=desired,
+            billing_event=billing_event,
+            daily_budget=daily_budget,
+            lifetime_budget=lifetime_budget,
+            countries=countries,
+            age_min=age_min,
+            age_max=age_max,
+            genders=genders,
+            targeting_json=targeting_json,
+            promoted_object_json=promoted_object_json,
+            start_time=start_time,
+            end_time=end_time,
+        )
+    except MetaGraphError as e:
+        return (
+            f"Failed to create ad set: {e}\n"
+            "Ensure FACEBOOK_ACCESS_TOKEN has ads_management, campaign_id is valid, "
+            "and conversion goals include promoted_object_json when Meta requires it."
+        )
+
+    lines = [
+        "Meta ad set created (Graph API)",
+        f"Ad set ID: {row.get('adset_id')}",
+        f"Name: {row.get('adset_name')}",
+        f"Campaign ID: {row.get('campaign_id')}",
+        f"Status: {row.get('status')}",
+        f"Optimization: {row.get('optimization_goal')}",
+        f"Billing event: {row.get('billing_event')}",
+        f"Account: {row.get('account_id')}",
+        f"Targeting: {row.get('targeting_summary') or '—'}",
+        f"Start: {row.get('start_time') or '—'}",
+    ]
+    if row.get("end_time"):
+        lines.append(f"End: {row.get('end_time')}")
+    if row.get("daily_budget"):
+        lines.append(f"Daily budget: {row.get('daily_budget')}")
+    if row.get("lifetime_budget"):
+        lines.append(f"Lifetime budget: {row.get('lifetime_budget')}")
+    promoted = row.get("promoted_object") or {}
+    if promoted:
+        lines.append(f"Promoted object: {promoted}")
+    lines.append(f"Ads Manager: {row.get('ads_manager_url')}")
+    lines.append(
+        "Note: ad set is PAUSED by default and has no ad yet — "
+        "it cannot deliver until an ad exists and status is ACTIVE "
+        "(use set_object_status to activate)."
+        if (row.get("status") or "").upper() == "PAUSED"
+        else "Note: ad set is ACTIVE but still needs an ad before it can deliver."
+    )
+    return "\n".join(lines)
+
+
+@mcp.tool()
 def set_object_status(
     object_id: str,
     status: str,
@@ -1919,6 +2007,7 @@ if __name__ == "__main__":
         "get_top_ads",
         "get_campaign_budgets",
         "create_campaign",
+        "create_adset",
         "set_object_status",
         "get_adset_targeting",
         "get_multi_account_spend",

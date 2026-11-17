@@ -13,7 +13,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any, Optional
 from urllib.parse import urlencode
 
@@ -1138,6 +1138,29 @@ class MetaGraphClient:
             "FINANCIAL_PRODUCTS_SERVICES",
         }
     )
+    ADSET_OPTIMIZATION_GOALS = frozenset(
+        {
+            "NONE",
+            "LINK_CLICKS",
+            "LANDING_PAGE_VIEWS",
+            "IMPRESSIONS",
+            "REACH",
+            "OFFSITE_CONVERSIONS",
+            "VALUE",
+            "LEAD_GENERATION",
+            "CONVERSATIONS",
+            "THRUPLAY",
+            "APP_INSTALLS",
+        }
+    )
+    ADSET_BILLING_EVENTS = frozenset(
+        {
+            "IMPRESSIONS",
+            "LINK_CLICKS",
+            "THRUPLAY",
+            "APP_INSTALLS",
+        }
+    )
 
     @staticmethod
     def _budget_display(raw: Any) -> str:
@@ -1258,6 +1281,206 @@ class MetaGraphClient:
             "ads_manager_url": (
                 f"https://www.facebook.com/adsmanager/manage/campaigns"
                 f"?act={act}&selected_campaign_ids={campaign_id}"
+            ),
+            "raw": data,
+        }
+
+    @staticmethod
+    def build_simple_targeting(
+        *,
+        countries: str = "US",
+        age_min: Any = 18,
+        age_max: Any = 65,
+        genders: str = "",
+    ) -> dict[str, Any]:
+        """Build a minimal Meta targeting object from Claude-friendly fields."""
+        country_list = [
+            c.strip().upper()
+            for c in (countries or "US").replace(";", ",").split(",")
+            if c.strip()
+        ]
+        if not country_list:
+            country_list = ["US"]
+        try:
+            amin = int(age_min if age_min not in ("", None) else 18)
+            amax = int(age_max if age_max not in ("", None) else 65)
+        except (TypeError, ValueError) as exc:
+            raise MetaGraphError("age_min and age_max must be integers") from exc
+        if amin < 13 or amax > 65 or amin > amax:
+            raise MetaGraphError(
+                "age_min/age_max must satisfy 13 ≤ age_min ≤ age_max ≤ 65"
+            )
+        targeting: dict[str, Any] = {
+            "geo_locations": {"countries": country_list},
+            "age_min": amin,
+            "age_max": amax,
+        }
+        gender_vals: list[int] = []
+        for g in (genders or "").replace(";", ",").split(","):
+            g = g.strip()
+            if not g:
+                continue
+            try:
+                gi = int(g)
+            except ValueError as exc:
+                raise MetaGraphError(
+                    "genders must be Meta codes: 1 (men), 2 (women)"
+                ) from exc
+            if gi not in (1, 2):
+                raise MetaGraphError(
+                    "genders must be Meta codes: 1 (men), 2 (women)"
+                )
+            if gi not in gender_vals:
+                gender_vals.append(gi)
+        if gender_vals:
+            targeting["genders"] = gender_vals
+        return targeting
+
+    def create_adset(
+        self,
+        name: str,
+        campaign_id: str,
+        optimization_goal: str,
+        *,
+        account_id: str = "",
+        status: str = "PAUSED",
+        billing_event: str = "IMPRESSIONS",
+        daily_budget: Any = "",
+        lifetime_budget: Any = "",
+        countries: str = "US",
+        age_min: Any = 18,
+        age_max: Any = 65,
+        genders: str = "",
+        targeting_json: str = "",
+        promoted_object_json: str = "",
+        start_time: str = "",
+        end_time: str = "",
+    ) -> dict[str, Any]:
+        """
+        Create a Meta ad set under an existing campaign (needs ads_management).
+
+        Defaults to PAUSED. Prefer targeting_json when set; otherwise build from
+        countries / age / genders.
+        """
+        adset_name = (name or "").strip()
+        if not adset_name:
+            raise MetaGraphError("Ad set name is required")
+        camp_id = (campaign_id or "").strip()
+        if not camp_id:
+            raise MetaGraphError("campaign_id is required")
+
+        goal = (optimization_goal or "").strip().upper()
+        if goal not in self.ADSET_OPTIMIZATION_GOALS:
+            allowed = ", ".join(sorted(self.ADSET_OPTIMIZATION_GOALS))
+            raise MetaGraphError(
+                f"Unknown optimization_goal {optimization_goal!r}. Use one of: {allowed}"
+            )
+
+        billing = (billing_event or "IMPRESSIONS").strip().upper() or "IMPRESSIONS"
+        if billing not in self.ADSET_BILLING_EVENTS:
+            allowed = ", ".join(sorted(self.ADSET_BILLING_EVENTS))
+            raise MetaGraphError(
+                f"Unknown billing_event {billing_event!r}. Use one of: {allowed}"
+            )
+
+        desired = (status or "PAUSED").strip().upper() or "PAUSED"
+        if desired not in ("ACTIVE", "PAUSED"):
+            raise MetaGraphError("status must be ACTIVE or PAUSED")
+
+        raw_targeting = (targeting_json or "").strip()
+        if raw_targeting:
+            try:
+                targeting = json.loads(raw_targeting)
+            except json.JSONDecodeError as exc:
+                raise MetaGraphError(
+                    f"targeting_json must be valid JSON: {exc}"
+                ) from exc
+            if not isinstance(targeting, dict):
+                raise MetaGraphError("targeting_json must be a JSON object")
+        else:
+            targeting = self.build_simple_targeting(
+                countries=countries,
+                age_min=age_min,
+                age_max=age_max,
+                genders=genders,
+            )
+
+        daily_cents = (
+            self._budget_to_cents(daily_budget)
+            if daily_budget not in ("", None)
+            else None
+        )
+        lifetime_cents = (
+            self._budget_to_cents(lifetime_budget)
+            if lifetime_budget not in ("", None)
+            else None
+        )
+        if daily_cents is not None and lifetime_cents is not None:
+            raise MetaGraphError(
+                "Pass only one of daily_budget or lifetime_budget, not both"
+            )
+
+        promoted: Optional[dict[str, Any]] = None
+        raw_promoted = (promoted_object_json or "").strip()
+        if raw_promoted:
+            try:
+                promoted = json.loads(raw_promoted)
+            except json.JSONDecodeError as exc:
+                raise MetaGraphError(
+                    f"promoted_object_json must be valid JSON: {exc}"
+                ) from exc
+            if not isinstance(promoted, dict):
+                raise MetaGraphError("promoted_object_json must be a JSON object")
+
+        start = (start_time or "").strip()
+        if not start:
+            start = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+        act = self.resolve_account_id(account_id)
+        params: dict[str, Any] = {
+            "name": adset_name,
+            "campaign_id": camp_id,
+            "optimization_goal": goal,
+            "billing_event": billing,
+            "status": desired,
+            "targeting": json.dumps(targeting, separators=(",", ":")),
+            "start_time": start,
+        }
+        end = (end_time or "").strip()
+        if end:
+            params["end_time"] = end
+        if daily_cents is not None:
+            params["daily_budget"] = daily_cents
+        if lifetime_cents is not None:
+            params["lifetime_budget"] = lifetime_cents
+        if promoted is not None:
+            params["promoted_object"] = json.dumps(promoted, separators=(",", ":"))
+
+        data = self._graph_post(f"act_{act}/adsets", params)
+        adset_id = str(data.get("id") or "").strip()
+        if not adset_id:
+            raise MetaGraphError(f"Ad set create returned no id: {data}")
+
+        return {
+            "adset_id": adset_id,
+            "adset_name": adset_name,
+            "campaign_id": camp_id,
+            "status": desired,
+            "optimization_goal": goal,
+            "billing_event": billing,
+            "account_id": f"act_{act}",
+            "daily_budget": self._budget_display(daily_cents) if daily_cents else "",
+            "lifetime_budget": (
+                self._budget_display(lifetime_cents) if lifetime_cents else ""
+            ),
+            "start_time": start,
+            "end_time": end,
+            "targeting": targeting,
+            "targeting_summary": self._summarize_targeting(targeting),
+            "promoted_object": promoted or {},
+            "ads_manager_url": (
+                f"https://www.facebook.com/adsmanager/manage/adsets"
+                f"?act={act}&selected_adset_ids={adset_id}"
             ),
             "raw": data,
         }
