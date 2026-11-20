@@ -99,8 +99,8 @@ Reload MCP in Cursor settings after starting the server.
 | `list_accounts` | Ad accounts + parent Business Manager |
 | `list_campaigns` | Campaigns in an ad account |
 | `list_adsets` | Ad sets in an ad account |
-| `list_creatives` | Ads + best creative still URL (hash/video/story) + source label |
-| `get_creative_images` | Download best stills as base64; flags weak `thumbnail_fallback` |
+| `list_creatives` | Ads + all creative still URLs (cover + carousel/feed cards) + preferred non-cover still |
+| `get_creative_images` | Download all cards as base64 (`images[]`); top-level prefers non-cover; flags `thumbnail_fallback` |
 | `get_integration_status` | Token / app health check |
 | `get_ads_summary` | KPI totals for a date range |
 | `get_daily_trend` | Day-by-day spend & metrics |
@@ -131,8 +131,8 @@ Reload MCP in Cursor settings after starting the server.
 - "Hourly performance yesterday"
 - "Age and gender breakdown last week"
 - "Conversions by state for yesterday"
-- "Show creatives with full image and preview URLs"
-- "Download creative images for these ads so I can put screenshots in a sheet"
+- "Show creatives with full image URLs including every carousel card"
+- "Download all creative images for these ads (every carousel/feed card) for a sheet"
 - "Who does the Prospecting ad set target?"
 - "Campaign budgets and status"
 - "Create a PAUSED Meta campaign named CH_US_TEST with objective OUTCOME_SALES"

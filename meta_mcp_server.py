@@ -458,8 +458,8 @@ ACCOUNTS
 CAMPAIGNS, AD SETS & CREATIVES
 - "List campaigns for Drag Race"
 - "List ad sets"
-- "Show ads / creatives with full image and preview URLs"
-- "Download creative images for these ads so I can put screenshots in a sheet"
+- "Show ads / creatives with full image and preview URLs (incl. carousel cards)"
+- "Download all creative images for these ads (every carousel/feed card) for a sheet"
 - "Who does this ad set target?"
 - "Campaign budgets and status"
 - "Create a PAUSED Meta campaign named CH_US_TEST with objective OUTCOME_SALES"
@@ -1105,9 +1105,9 @@ def list_creatives(
     lines = [
         f"Found {len(rows)} ad creative(s).",
         "URLs below are complete (not truncated).",
-        "image_source shows how the still was resolved "
-        "(adimages_hash / video_picture / story / thumbnail_fallback).",
-        "For sheet screenshots, call get_creative_images so the connector downloads the file.",
+        "Multi-image / carousel ads list every card under Images[]. "
+        "best Image prefers a non-cover card when the cover is shared across ads.",
+        "For sheet screenshots, call get_creative_images (downloads all cards).",
         "",
     ]
     for i, r in enumerate(rows, 1):
@@ -1118,7 +1118,7 @@ def list_creatives(
             or "—"
         )
         hashes = r.get("image_hashes") or []
-        hash_txt = ", ".join(str(h) for h in hashes[:5]) if hashes else "—"
+        hash_txt = ", ".join(str(h) for h in hashes[:8]) if hashes else "—"
         lines.extend(
             [
                 f"{i}. {(r.get('ad_name') or '(unnamed)').strip()}",
@@ -1129,15 +1129,24 @@ def list_creatives(
                 f"   Title: {(r.get('title') or '—')}",
                 f"   CTA: {r.get('cta') or '—'}",
                 f"   Video ID: {r.get('video_id') or '—'}",
+                f"   Image count: {r.get('image_count') or 0}",
                 f"   Image hashes: {hash_txt}",
-                f"   Image source: {r.get('image_source') or '—'}",
-                f"   Image: {image}",
+                f"   Best image role: {r.get('image_role') or '—'} "
+                f"({r.get('image_source') or '—'})",
+                f"   Best image: {image}",
+                f"   Cover image: {r.get('cover_image_url') or '—'}",
                 f"   Thumbnail: {r.get('thumbnail_url') or '—'}",
                 f"   Preview: {r.get('preview_url') or '—'}",
                 f"   Ads Manager: {r.get('ads_manager_url') or '—'}",
-                "",
             ]
         )
+        for im in (r.get("images") or [])[:8]:
+            lines.append(
+                f"   Images[{im.get('index')}]: role={im.get('role') or '—'} "
+                f"label={im.get('label') or '—'} source={im.get('source') or '—'} "
+                f"url={im.get('url') or '—'}"
+            )
+        lines.append("")
     return "\n".join(lines).rstrip()
 
 
@@ -1147,12 +1156,13 @@ def get_creative_images(
     ad_ids: str = "",
     account_id: str = "",
     limit: int = 10,
+    max_images_per_ad: int = 6,
 ) -> str:
     """
-    Download creative images on the connector and return base64 for sheet embedding.
+    Download creative stills on the connector (all carousel/feed cards when present).
 
-    Use this when Claude cannot fetch Meta CDN URLs. Pass search (name contains)
-    and/or comma/space-separated ad_ids. Limit is capped at 20.
+    Pass search and/or ad_ids. Top-level image_base64 prefers a non-cover card when
+    the cover image is shared across ads; images[] holds every downloaded card.
     """
     raw_ids = (
         (ad_ids or "")
@@ -1172,6 +1182,7 @@ def get_creative_images(
             search=search,
             limit=max(1, min(int(limit or 10), 20)),
             ad_ids=ids or None,
+            max_images_per_ad=max(1, min(int(max_images_per_ad or 6), 10)),
         )
     except (MetaGraphError, ValueError, RuntimeError) as e:
         return f"Failed to fetch creative images: {e}"
@@ -1179,18 +1190,19 @@ def get_creative_images(
         return "No ads/creatives found for that search or ad_ids."
 
     ok_n = sum(1 for r in rows if r.get("ok"))
+    multi_n = sum(1 for r in rows if int(r.get("image_count") or 0) > 1)
     weak_n = sum(1 for r in rows if r.get("image_source") == "thumbnail_fallback")
     lines = [
-        f"Creative images: {ok_n}/{len(rows)} downloaded on the connector.",
-        f"Weak Meta thumbnail_fallback stills: {weak_n}/{len(rows)} "
-        "(may not match the on-ad creative).",
-        "Each ok=true block includes image_base64 for embedding in a sheet.",
-        "Prefer image_source=adimages_hash|video_picture|object_story_full_picture.",
+        f"Creative images: {ok_n}/{len(rows)} ads with at least one download.",
+        f"Multi-image creatives: {multi_n}/{len(rows)}.",
+        f"Weak thumbnail_fallback: {weak_n}/{len(rows)}.",
+        "Top-level image_base64 prefers carousel/feed cards over a shared cover.",
+        "Each images[n] block may include its own image_base64.",
         "",
     ]
     for i, r in enumerate(rows, 1):
         hashes = r.get("image_hashes") or []
-        hash_txt = ", ".join(str(h) for h in hashes[:5]) if hashes else "—"
+        hash_txt = ", ".join(str(h) for h in hashes[:8]) if hashes else "—"
         lines.append(f"--- Ad {i}: {(r.get('ad_name') or '(unnamed)').strip()} ---")
         lines.append(f"ad_id: {r.get('ad_id') or '—'}")
         lines.append(f"creative_id: {r.get('creative_id') or '—'}")
@@ -1199,9 +1211,14 @@ def get_creative_images(
         lines.append(f"title: {r.get('title') or '—'}")
         lines.append(f"cta: {r.get('cta') or '—'}")
         lines.append(f"video_id: {r.get('video_id') or '—'}")
+        lines.append(f"image_count: {r.get('image_count') or 0}")
         lines.append(f"image_hashes: {hash_txt}")
-        lines.append(f"image_source: {r.get('image_source') or '—'}")
-        lines.append(f"image_url: {r.get('image_url') or '—'}")
+        lines.append(
+            f"preferred_role: {r.get('image_role') or '—'} "
+            f"({r.get('image_source') or '—'})"
+        )
+        lines.append(f"preferred_image_url: {r.get('image_url') or '—'}")
+        lines.append(f"cover_image_url: {r.get('cover_image_url') or '—'}")
         lines.append(f"ads_manager_url: {r.get('ads_manager_url') or '—'}")
         if r.get("ok"):
             lines.append("ok: true")
@@ -1213,6 +1230,25 @@ def get_creative_images(
         else:
             lines.append("ok: false")
             lines.append(f"error: {r.get('error') or 'unknown error'}")
+        for im in r.get("images") or []:
+            lines.append(
+                f"images[{im.get('index')}]: role={im.get('role') or '—'} "
+                f"label={im.get('label') or '—'} source={im.get('source') or '—'} "
+                f"ok={bool(im.get('ok'))} url={im.get('url') or '—'}"
+            )
+            if im.get("ok"):
+                lines.append(
+                    f"images[{im.get('index')}].mime_type: {im.get('mime_type') or '—'}"
+                )
+                lines.append(
+                    f"images[{im.get('index')}].byte_size: {im.get('byte_size') or 0}"
+                )
+                lines.append(
+                    f"images[{im.get('index')}].image_base64: "
+                    f"{im.get('image_base64') or ''}"
+                )
+            elif im.get("error"):
+                lines.append(f"images[{im.get('index')}].error: {im.get('error')}")
         lines.append("")
     return "\n".join(lines).rstrip()
 
