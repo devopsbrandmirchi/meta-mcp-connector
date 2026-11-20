@@ -99,8 +99,8 @@ Reload MCP in Cursor settings after starting the server.
 | `list_accounts` | Ad accounts + parent Business Manager |
 | `list_campaigns` | Campaigns in an ad account |
 | `list_adsets` | Ad sets in an ad account |
-| `list_creatives` | Ads + full creative image / preview / Ads Manager URLs |
-| `get_creative_images` | Download creative stills on the connector (base64 for sheet screenshots) |
+| `list_creatives` | Ads + best creative still URL (hash/video/story) + source label |
+| `get_creative_images` | Download best stills as base64; flags weak `thumbnail_fallback` |
 | `get_integration_status` | Token / app health check |
 | `get_ads_summary` | KPI totals for a date range |
 | `get_daily_trend` | Day-by-day spend & metrics |

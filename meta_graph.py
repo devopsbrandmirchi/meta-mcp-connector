@@ -780,7 +780,7 @@ class MetaGraphClient:
         "id,name,status,effective_status,adset_id,campaign_id,"
         "creative{id,name,thumbnail_url,image_url,image_hash,object_type,"
         "title,body,call_to_action_type,link_url,video_id,"
-        "object_story_spec,asset_feed_spec}"
+        "effective_object_story_id,object_story_spec,asset_feed_spec}"
     )
 
     @staticmethod
@@ -813,7 +813,66 @@ class MetaGraphClient:
                 if isinstance(vid, dict):
                     add(vid.get("thumbnail_hash"))
                     add(vid.get("image_hash"))
+                    add(vid.get("video_thumbnail_hash"))
         return hashes
+
+    @staticmethod
+    def _collect_direct_image_urls(creative: dict[str, Any]) -> list[str]:
+        """URLs embedded in story/feed specs (often better than creative.thumbnail_url)."""
+        urls: list[str] = []
+        seen: set[str] = set()
+
+        def add(value: Any) -> None:
+            u = str(value or "").strip()
+            if u.startswith(("http://", "https://")) and u not in seen:
+                seen.add(u)
+                urls.append(u)
+
+        add(creative.get("image_url"))
+        story = creative.get("object_story_spec")
+        if isinstance(story, dict):
+            for key in ("link_data", "video_data", "photo_data"):
+                block = story.get(key)
+                if isinstance(block, dict):
+                    add(block.get("picture"))
+                    add(block.get("image_url"))
+                    add(block.get("url"))
+        feed = creative.get("asset_feed_spec")
+        if isinstance(feed, dict):
+            for img in feed.get("images") or []:
+                if isinstance(img, dict):
+                    add(img.get("url"))
+                    add(img.get("thumbnail_url"))
+            for vid in feed.get("videos") or []:
+                if isinstance(vid, dict):
+                    add(vid.get("thumbnail_url"))
+                    add(vid.get("picture"))
+        return urls
+
+    @staticmethod
+    def _collect_video_ids(creative: dict[str, Any]) -> list[str]:
+        ids: list[str] = []
+        seen: set[str] = set()
+
+        def add(value: Any) -> None:
+            vid = str(value or "").strip()
+            if vid and vid not in seen:
+                seen.add(vid)
+                ids.append(vid)
+
+        add(creative.get("video_id"))
+        story = creative.get("object_story_spec")
+        if isinstance(story, dict):
+            video_data = story.get("video_data")
+            if isinstance(video_data, dict):
+                add(video_data.get("video_id"))
+        feed = creative.get("asset_feed_spec")
+        if isinstance(feed, dict):
+            for vid in feed.get("videos") or []:
+                if isinstance(vid, dict):
+                    add(vid.get("video_id"))
+                    add(vid.get("id"))
+        return ids
 
     def resolve_adimage_urls(
         self, account_id: str, hashes: list[str]
@@ -848,19 +907,148 @@ class MetaGraphClient:
                     out[h] = url
         return out
 
+    def resolve_video_pictures(self, video_ids: list[str]) -> dict[str, str]:
+        """Map video ids → best still URL (picture / preferred thumbnail)."""
+        out: dict[str, str] = {}
+        unique = [v for v in dict.fromkeys(video_ids) if v]
+        for vid in unique:
+            try:
+                data = self._graph_get(
+                    vid,
+                    {"fields": "id,picture,thumbnails"},
+                )
+            except MetaGraphError as exc:
+                logger.warning("video picture lookup failed for %s: %s", vid, exc)
+                continue
+            picture = str(data.get("picture") or "").strip()
+            if picture:
+                out[vid] = picture
+                continue
+            thumbs = data.get("thumbnails")
+            # thumbnails may be {data: [...]} or a list
+            rows = []
+            if isinstance(thumbs, dict):
+                rows = thumbs.get("data") or []
+            elif isinstance(thumbs, list):
+                rows = thumbs
+            preferred = ""
+            for t in rows:
+                if not isinstance(t, dict):
+                    continue
+                uri = str(t.get("uri") or t.get("id") or "").strip()
+                if not uri.startswith("http"):
+                    continue
+                if t.get("is_preferred"):
+                    preferred = uri
+                    break
+                if not preferred:
+                    preferred = uri
+            if preferred:
+                out[vid] = preferred
+        return out
+
+    def resolve_story_pictures(self, story_ids: list[str]) -> dict[str, str]:
+        """Map effective_object_story_id → full_picture / picture."""
+        out: dict[str, str] = {}
+        unique = [s for s in dict.fromkeys(story_ids) if s]
+        for sid in unique:
+            try:
+                data = self._graph_get(
+                    sid,
+                    {"fields": "id,full_picture,picture"},
+                )
+            except MetaGraphError as exc:
+                logger.warning("story picture lookup failed for %s: %s", sid, exc)
+                continue
+            url = str(data.get("full_picture") or data.get("picture") or "").strip()
+            if url.startswith("http"):
+                out[sid] = url
+        return out
+
     def _best_image_url(
         self,
         creative: dict[str, Any],
         hash_urls: dict[str, str],
     ) -> str:
+        """Backward-compatible helper — prefer resolve_creative_image()."""
+        resolved = self.resolve_creative_image(
+            creative, hash_urls=hash_urls, video_pictures={}, story_pictures={}
+        )
+        return str(resolved.get("url") or "")
+
+    def resolve_creative_image(
+        self,
+        creative: dict[str, Any],
+        *,
+        hash_urls: dict[str, str],
+        video_pictures: dict[str, str],
+        story_pictures: dict[str, str],
+    ) -> dict[str, str]:
+        """
+        Pick the best still for a creative and label the source.
+
+        Priority: creative image_url → story/feed direct URLs → adimages hashes →
+        video picture → effective story full_picture → creative thumbnail_url.
+        """
+        hashes = self._collect_image_hashes(creative)
+        video_ids = self._collect_video_ids(creative)
+        story_id = str(creative.get("effective_object_story_id") or "").strip()
+
         direct = str(creative.get("image_url") or "").strip()
-        if direct:
-            return direct
-        for h in self._collect_image_hashes(creative):
+        if direct.startswith("http"):
+            return {
+                "url": direct,
+                "source": "creative_image_url",
+                "video_id": video_ids[0] if video_ids else "",
+            }
+
+        for url in self._collect_direct_image_urls(creative):
+            # Skip if it's the same as weak thumbnail and we have better options later —
+            # still prefer direct story URLs over thumbnail.
+            if url and url != str(creative.get("thumbnail_url") or "").strip():
+                return {
+                    "url": url,
+                    "source": "story_or_feed_url",
+                    "video_id": video_ids[0] if video_ids else "",
+                }
+            if url:
+                return {
+                    "url": url,
+                    "source": "story_or_feed_url",
+                    "video_id": video_ids[0] if video_ids else "",
+                }
+
+        for h in hashes:
             url = hash_urls.get(h)
             if url:
-                return url
-        return str(creative.get("thumbnail_url") or "").strip()
+                return {
+                    "url": url,
+                    "source": "adimages_hash",
+                    "video_id": video_ids[0] if video_ids else "",
+                }
+
+        for vid in video_ids:
+            url = video_pictures.get(vid)
+            if url:
+                return {"url": url, "source": "video_picture", "video_id": vid}
+
+        if story_id:
+            url = story_pictures.get(story_id)
+            if url:
+                return {
+                    "url": url,
+                    "source": "object_story_full_picture",
+                    "video_id": video_ids[0] if video_ids else "",
+                }
+
+        thumb = str(creative.get("thumbnail_url") or "").strip()
+        if thumb:
+            return {
+                "url": thumb,
+                "source": "thumbnail_fallback",
+                "video_id": video_ids[0] if video_ids else "",
+            }
+        return {"url": "", "source": "none", "video_id": video_ids[0] if video_ids else ""}
 
     def list_ad_creatives(
         self,
@@ -871,7 +1059,7 @@ class MetaGraphClient:
         include_preview: bool = True,
         ad_ids: Optional[list[str]] = None,
     ) -> list[dict[str, Any]]:
-        """List ads with creative thumbnail / full image URLs."""
+        """List ads with the best available creative still URL + source label."""
         act = self.resolve_account_id(account_id)
         rows: list[dict[str, Any]] = []
         wanted = [str(a).strip() for a in (ad_ids or []) if str(a).strip()]
@@ -905,9 +1093,31 @@ class MetaGraphClient:
             for row in rows[:limit]
         ]
         all_hashes: list[str] = []
+        all_video_ids: list[str] = []
+        all_story_ids: list[str] = []
         for creative in creatives:
             all_hashes.extend(self._collect_image_hashes(creative))
+            all_video_ids.extend(self._collect_video_ids(creative))
+            sid = str(creative.get("effective_object_story_id") or "").strip()
+            if sid:
+                all_story_ids.append(sid)
+
         hash_urls = self.resolve_adimage_urls(act, all_hashes)
+        video_pictures = self.resolve_video_pictures(all_video_ids)
+        # Only fetch stories when hash/video resolution is incomplete for that creative.
+        need_stories: list[str] = []
+        for creative in creatives:
+            provisional = self.resolve_creative_image(
+                creative,
+                hash_urls=hash_urls,
+                video_pictures=video_pictures,
+                story_pictures={},
+            )
+            if provisional.get("source") in ("thumbnail_fallback", "none"):
+                sid = str(creative.get("effective_object_story_id") or "").strip()
+                if sid:
+                    need_stories.append(sid)
+        story_pictures = self.resolve_story_pictures(need_stories)
 
         out: list[dict[str, Any]] = []
         for row, creative in zip(rows[:limit], creatives):
@@ -930,7 +1140,13 @@ class MetaGraphClient:
                     preview_url = ""
             image_url = str(creative.get("image_url") or "").strip()
             thumbnail_url = str(creative.get("thumbnail_url") or "").strip()
-            best_image_url = self._best_image_url(creative, hash_urls)
+            resolved = self.resolve_creative_image(
+                creative,
+                hash_urls=hash_urls,
+                video_pictures=video_pictures,
+                story_pictures=story_pictures,
+            )
+            video_ids = self._collect_video_ids(creative)
             out.append(
                 {
                     "ad_id": ad_id,
@@ -940,15 +1156,21 @@ class MetaGraphClient:
                     "campaign_id": row.get("campaign_id") or "",
                     "creative_id": creative.get("id") or "",
                     "creative_name": creative.get("name") or "",
+                    "object_type": creative.get("object_type") or "",
                     "thumbnail_url": thumbnail_url,
                     "image_url": image_url,
-                    "best_image_url": best_image_url,
+                    "best_image_url": resolved.get("url") or "",
+                    "image_source": resolved.get("source") or "none",
                     "image_hashes": self._collect_image_hashes(creative),
+                    "effective_object_story_id": creative.get("effective_object_story_id")
+                    or "",
                     "title": creative.get("title") or "",
                     "body": creative.get("body") or "",
                     "cta": creative.get("call_to_action_type") or "",
                     "link_url": creative.get("link_url") or "",
-                    "video_id": creative.get("video_id") or "",
+                    "video_id": resolved.get("video_id")
+                    or (video_ids[0] if video_ids else ""),
+                    "video_ids": video_ids,
                     "preview_url": preview_url,
                     "ads_manager_url": (
                         f"https://www.facebook.com/adsmanager/manage/ads"
@@ -1019,6 +1241,7 @@ class MetaGraphClient:
                 or str(row.get("image_url") or "").strip()
                 or str(row.get("thumbnail_url") or "").strip()
             )
+            image_source = str(row.get("image_source") or "").strip() or "none"
             item: dict[str, Any] = {
                 "ad_id": row.get("ad_id") or "",
                 "ad_name": row.get("ad_name") or "",
@@ -1028,7 +1251,9 @@ class MetaGraphClient:
                 "title": row.get("title") or "",
                 "cta": row.get("cta") or "",
                 "video_id": row.get("video_id") or "",
+                "image_hashes": row.get("image_hashes") or [],
                 "image_url": image_url,
+                "image_source": image_source,
                 "ads_manager_url": row.get("ads_manager_url") or "",
                 "ok": False,
                 "error": "",
@@ -1044,6 +1269,11 @@ class MetaGraphClient:
                 downloaded = self.download_image_bytes(image_url)
                 item.update(downloaded)
                 item["ok"] = True
+                if image_source == "thumbnail_fallback":
+                    item["error"] = (
+                        "Downloaded Meta thumbnail_fallback — may not match the "
+                        "on-ad creative for video/dynamic ads."
+                    )
             except MetaGraphError as exc:
                 item["error"] = str(exc)
             except Exception as exc:  # noqa: BLE001 — surface download failures per ad

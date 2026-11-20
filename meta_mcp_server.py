@@ -1105,6 +1105,8 @@ def list_creatives(
     lines = [
         f"Found {len(rows)} ad creative(s).",
         "URLs below are complete (not truncated).",
+        "image_source shows how the still was resolved "
+        "(adimages_hash / video_picture / story / thumbnail_fallback).",
         "For sheet screenshots, call get_creative_images so the connector downloads the file.",
         "",
     ]
@@ -1115,13 +1117,20 @@ def list_creatives(
             or str(r.get("thumbnail_url") or "").strip()
             or "—"
         )
+        hashes = r.get("image_hashes") or []
+        hash_txt = ", ".join(str(h) for h in hashes[:5]) if hashes else "—"
         lines.extend(
             [
                 f"{i}. {(r.get('ad_name') or '(unnamed)').strip()}",
                 f"   Ad ID: {r.get('ad_id') or '—'}",
+                f"   Creative ID: {r.get('creative_id') or '—'}",
                 f"   Status: {r.get('status') or '—'}",
+                f"   Object type: {r.get('object_type') or '—'}",
                 f"   Title: {(r.get('title') or '—')}",
                 f"   CTA: {r.get('cta') or '—'}",
+                f"   Video ID: {r.get('video_id') or '—'}",
+                f"   Image hashes: {hash_txt}",
+                f"   Image source: {r.get('image_source') or '—'}",
                 f"   Image: {image}",
                 f"   Thumbnail: {r.get('thumbnail_url') or '—'}",
                 f"   Preview: {r.get('preview_url') or '—'}",
@@ -1170,34 +1179,40 @@ def get_creative_images(
         return "No ads/creatives found for that search or ad_ids."
 
     ok_n = sum(1 for r in rows if r.get("ok"))
+    weak_n = sum(1 for r in rows if r.get("image_source") == "thumbnail_fallback")
     lines = [
         f"Creative images: {ok_n}/{len(rows)} downloaded on the connector.",
+        f"Weak Meta thumbnail_fallback stills: {weak_n}/{len(rows)} "
+        "(may not match the on-ad creative).",
         "Each ok=true block includes image_base64 for embedding in a sheet.",
-        "Video-only creatives may have no still image.",
+        "Prefer image_source=adimages_hash|video_picture|object_story_full_picture.",
         "",
     ]
     for i, r in enumerate(rows, 1):
+        hashes = r.get("image_hashes") or []
+        hash_txt = ", ".join(str(h) for h in hashes[:5]) if hashes else "—"
         lines.append(f"--- Ad {i}: {(r.get('ad_name') or '(unnamed)').strip()} ---")
         lines.append(f"ad_id: {r.get('ad_id') or '—'}")
+        lines.append(f"creative_id: {r.get('creative_id') or '—'}")
         lines.append(f"status: {r.get('status') or '—'}")
         lines.append(f"campaign_id: {r.get('campaign_id') or '—'}")
         lines.append(f"title: {r.get('title') or '—'}")
         lines.append(f"cta: {r.get('cta') or '—'}")
+        lines.append(f"video_id: {r.get('video_id') or '—'}")
+        lines.append(f"image_hashes: {hash_txt}")
+        lines.append(f"image_source: {r.get('image_source') or '—'}")
         lines.append(f"image_url: {r.get('image_url') or '—'}")
         lines.append(f"ads_manager_url: {r.get('ads_manager_url') or '—'}")
         if r.get("ok"):
-            lines.append(f"ok: true")
+            lines.append("ok: true")
             lines.append(f"mime_type: {r.get('mime_type') or '—'}")
             lines.append(f"byte_size: {r.get('byte_size') or 0}")
+            if r.get("error"):
+                lines.append(f"warning: {r.get('error')}")
             lines.append(f"image_base64: {r.get('image_base64') or ''}")
         else:
             lines.append("ok: false")
             lines.append(f"error: {r.get('error') or 'unknown error'}")
-            if r.get("video_id"):
-                lines.append(
-                    f"video_id: {r.get('video_id')} "
-                    "(no image download for video files)"
-                )
         lines.append("")
     return "\n".join(lines).rstrip()
 
